@@ -1,5 +1,8 @@
 # FSDP1 -> FSDP2
 
+If you are new to TorchTitan's configuration or mesh model, read
+`docs/config_reference.md` and `docs/parallelism_primer.md` first.
+
 ## Why FSDP2?
 PyTorch's fully sharded data parallelism (FSDP) API, [`FullyShardedDataParallel`](https://pytorch.org/docs/stable/fsdp.html), looks to offer a performant eager-mode implementation, including communication bucketing and communication/computation overlap. It defines a `FlatParameter` by flattening and concatenating a group of parameters to represent a communication bucket. However, this `FlatParameter` complicates applying different behaviors to individual parameters within the `FlatParameter`, e.g. parameter freezing, parameter casting, etc., hurting composability, and it complicates the internal implementation, e.g. making state dict logic thousands of lines and requiring additional communications.
 

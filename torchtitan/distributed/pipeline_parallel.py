@@ -3,6 +3,94 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+
+"""
+Pipeline Parallelism (PP) Implementation
+=========================================
+
+This module implements Pipeline Parallelism for distributed LLM training.
+PP splits the model's layers across multiple GPUs, with each GPU (stage)
+holding a subset of the transformer blocks.
+
+PIPELINE PARALLELISM OVERVIEW:
+------------------------------
+Instead of each GPU having a full model copy (like DDP), PP distributes
+layers across GPUs:
+
+    GPU 0 (Stage 0)     GPU 1 (Stage 1)     GPU 2 (Stage 2)     GPU 3 (Stage 3)
+    ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+    │ Embeddings  │ --> │  Layers 4-7 │ --> │ Layers 8-11 │ --> │   Layers    │
+    │ Layers 0-3  │     │             │     │             │     │  12-15+Head │
+    └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+
+MICRO-BATCHING:
+---------------
+Naive PP has a "bubble" where GPUs sit idle waiting for activations:
+- Stage 0 processes batch, sends activations to Stage 1
+- Stage 0 is idle while Stages 1-3 process
+
+To reduce this bubble, we split the batch into micro-batches and overlap:
+
+    Time ->
+    Stage 0:  [F0][F1][F2][F3][--------------][B3][B2][B1][B0]
+    Stage 1:       [F0][F1][F2][F3][----][B3][B2][B1][B0]
+    Stage 2:            [F0][F1][F2][F3][B3][B2][B1][B0]
+    Stage 3:                 [F0][F1][F2][F3][B3][B2][B1][B0]
+
+    Legend: F=Forward, B=Backward, [-]=Bubble
+
+PIPELINE SCHEDULES:
+-------------------
+Different schedules trade off memory, bubbles, and implementation complexity:
+
+1. **GPipe**: All forwards, then all backwards. Simple but maximum memory.
+
+2. **1F1B (One Forward One Backward)**: Alternates forward/backward after warmup.
+   - Reduces peak memory (activations freed earlier)
+   - Still has some bubble
+
+3. **Interleaved 1F1B**: Each rank holds multiple non-contiguous stages.
+   - E.g., Rank 0 holds stages [0, 4], Rank 1 holds [1, 5], etc.
+   - Reduces bubble by processing alternating stages
+
+4. **Zero Bubble (ZB)**: Advanced scheduling that nearly eliminates bubble.
+   - Uses bi-directional communication and careful ordering
+
+5. **V-Schedule (DualPipeV)**: Pairs forward/backward of different stages.
+   - Good for overlapping with expert parallel communication
+
+VIRTUAL STAGES:
+---------------
+With looped schedules (Interleaved, ZB, V), each rank holds multiple
+"virtual stages" - non-adjacent chunks of the model. For example:
+
+    Physical Ranks:     0       1       2       3
+    Virtual Stage 0:    Yes     -       -       -
+    Virtual Stage 1:    -       Yes     -       -
+    Virtual Stage 2:    -       -       Yes     -
+    Virtual Stage 3:    -       -       -       Yes
+    Virtual Stage 4:    Yes     -       -       -     (looped back to rank 0)
+    ...
+
+This interleaving reduces bubble because each rank alternates work on
+different pipeline depths.
+
+LAYER DISTRIBUTION:
+-------------------
+The first and last stages often have additional modules (embeddings, output head)
+that can be computational heavier or lighter than transformer blocks. The
+`input_weight` and `output_weight` parameters adjust layer distribution to
+balance compute across stages.
+
+GOTCHAS:
+--------
+1. n_microbatches should be >= pp_degree for reasonable efficiency
+2. local_batch_size must be divisible by microbatch_size
+3. For looped schedules, num_virtual_stages must be divisible by pp_degree
+4. Model's forward() must tolerate missing/None layers
+5. Only the last stage computes and returns the loss
+"""
+
 import copy
 
 import math
@@ -49,13 +137,55 @@ def pipeline_llm(
     parallelize_fn: ParallelizeFunction,
     loss_fn: LossFunction,
 ) -> tuple[_PipelineSchedule, list[nn.Module], bool, bool]:
+    """
+    Set up Pipeline Parallelism for an LLM model.
+
+    This function:
+    1. Determines number of virtual stages based on schedule type
+    2. Generates module-to-stage mapping (which layers go to which stage)
+    3. Splits the model into pipeline stages
+    4. Applies other parallelisms (TP, FSDP, compile) to each stage
+    5. Builds the pipeline schedule
+
+    The function returns everything needed to run pipeline training:
+    - Schedule object that orchestrates micro-batch flow
+    - Model parts (one per virtual stage on this rank)
+    - Flags indicating if this rank has first/last stage
+
+    Args:
+        model: Full model on meta device (not yet initialized)
+        parallel_dims: Parallelism dimension manager
+        job_config: Training configuration
+        device: Target device for this rank
+        model_args: Model architecture parameters (needs n_layers)
+        parallelize_fn: Function to apply TP, AC, compile, FSDP
+        loss_fn: Loss function (will be wrapped for micro-batch scaling)
+
+    Returns:
+        tuple of:
+        - pp_schedule: Pipeline schedule object for training
+        - model_parts: List of model chunks owned by this rank
+        - has_first_stage: True if this rank owns the first pipeline stage
+        - has_last_stage: True if this rank owns the last pipeline stage
+
+    Raises:
+        ValueError: If model doesn't have n_layers attribute
+        ValueError: If stage configuration is incompatible with schedule type
+    """
     pp_mesh = parallel_dims.get_mesh("pp")
 
-    # Determine the number of virtual stages based on schedule type
+    # =========================================================================
+    # STEP 1: DETERMINE SCHEDULE TYPE AND VIRTUAL STAGES
+    # Different schedules require different numbers of virtual stages per rank:
+    # - Single-stage schedules (1F1B): 1 stage per rank
+    # - Multi-stage schedules (Interleaved): 2+ stages per rank
+    # =========================================================================
     schedule_class = get_schedule_class(
         job_config.parallelism.pipeline_parallel_schedule
     )
     is_single_stage_schedule = issubclass(schedule_class, PipelineScheduleSingle)
+    # Looped schedules (e.g., interleaved) use multiple virtual stages per rank.
+    # This reduces pipeline bubbles by having each rank work on non-adjacent stages.
     layers_per_stage = job_config.parallelism.pipeline_parallel_layers_per_stage
     if hasattr(model_args, "n_layers"):
         num_layers = model_args.n_layers
@@ -70,7 +200,7 @@ def pipeline_llm(
     # Calculate number of virtual stages
     if layers_per_stage is not None:
 
-        # Calculate number of virtual stages needed (using ceiling division)
+        # Calculate number of virtual stages needed (using ceiling division).
         # This allows for unequal distribution where stages can differ by at most 1 layer
         num_virtual_stages = math.ceil(
             (num_layers + input_weight + output_weight) / layers_per_stage
@@ -185,7 +315,7 @@ def build_pipeline_schedule(
     looped_schedule = issubclass(schedule_class, PipelineScheduleMulti)
     microbatch_size = job_config.parallelism.pipeline_parallel_microbatch_size
     batch_size = job_config.training.local_batch_size
-    # validate that the batch size is divisible by the microbatch_size otherwise we'll hang or error during training
+    # Validate that local batch can be evenly split into microbatches.
     if batch_size % microbatch_size != 0:
         raise ValueError(
             f"Batch size {job_config.training.local_batch_size} must be divisible by microbatch_size {microbatch_size}. "
@@ -195,6 +325,7 @@ def build_pipeline_schedule(
     # We expect that the number of local stages (`len(stages)`) is the same across all ranks
     num_total_stages = job_config.parallelism.pipeline_parallel_degree * len(stages)
     if n_microbatches < num_total_stages:
+        # Too few microbatches increases pipeline bubbles and reduces utilization.
         logger.warning(
             f"Number of microbatches ({n_microbatches}) is less than the total number "
             f"of stages ({num_total_stages}) which may result in a bubble in the pipeline."

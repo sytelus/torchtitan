@@ -145,6 +145,7 @@ def set_determinism(
         # Extract the seed for torch's main generator on rank 0 and standardizes on using that to build
         # seeds for unique SPMD groups
         seed_tensor = torch.get_rng_state()[:8].to(device)
+        # Broadcast a shared base seed so all ranks derive consistent per-mesh seeds.
         torch.distributed.broadcast(seed_tensor, src=0)
         seed = seed_tensor.to("cpu").view(torch.uint64).item()
     assert isinstance(seed, int)

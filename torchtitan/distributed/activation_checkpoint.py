@@ -4,8 +4,84 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# This file provides the util functions to apply activation checkpointing to the model.
-# Technically, this is not a part of distributed, but distributed module is the best place to put it.
+"""
+Activation Checkpointing (Gradient Checkpointing)
+==================================================
+
+Activation checkpointing (AC), also known as gradient checkpointing, is a memory
+optimization technique that trades compute for memory. Instead of storing all
+intermediate activations during the forward pass (for use in backward), AC
+discards them and recomputes them during backward.
+
+MEMORY VS COMPUTE TRADEOFF:
+---------------------------
+Without AC:
+- Forward: Compute and STORE all activations
+- Backward: Use stored activations for gradient computation
+- Memory: O(n_layers) activation memory
+
+With AC:
+- Forward: Compute activations, DISCARD at checkpoint boundaries
+- Backward: RECOMPUTE activations when needed, then compute gradients
+- Memory: O(1) or O(sqrt(n_layers)) activation memory
+- Compute: ~33% more forward compute (recomputation during backward)
+
+AC MODES:
+---------
+1. **full**: Checkpoint every transformer block.
+   - Maximum memory savings
+   - Maximum recomputation overhead (~33% more compute)
+
+2. **selective (layer)**: Checkpoint every Nth transformer block.
+   - selective_ac_option = "2" means checkpoint every 2nd block
+   - Balances memory and compute
+
+3. **selective (op)**: Fine-grained per-operation checkpointing.
+   - selective_ac_option = "op"
+   - Saves expensive ops (attention, matmul), recomputes cheap ops
+   - Best memory/compute balance but requires careful tuning
+
+4. **memory_budget**: Compiler-guided automatic checkpointing.
+   - Requires torch.compile
+   - Specify memory_budget (0.0 = full AC, 1.0 = no AC)
+   - Compiler optimally places checkpoints
+
+SELECTIVE OP AC EXPLAINED:
+--------------------------
+Not all operations are equally expensive to recompute. The op_sac_save_list
+specifies which operations should be saved (not recomputed):
+
+- Matrix multiplications (mm): Expensive, save them
+- Attention ops (SDPA): Very expensive, always save
+- Communication ops (reduce_scatter): Must save for correctness
+- max ops: Save for FP8 training (scaling factor computation)
+
+Other ops (activations, layer norm, dropout) are cheap to recompute.
+
+MEMORY BUDGET MODE:
+-------------------
+When using memory_budget mode with torch.compile:
+- Budget = 0.0: Equivalent to full AC (minimum memory)
+- Budget = 1.0: No AC (default runtime behavior, maximum memory)
+- Budget = 0.5: Compiler finds optimal checkpoint placement
+
+The compiler uses FLOP cost analysis to determine which activations to save.
+Set visualize_memory_budget_pareto=True to see the tradeoff curve.
+
+TIPS:
+-----
+- For training large models, start with "selective" mode with option "2"
+- If OOM, try "full" mode or reduce batch size
+- For production, memory_budget mode often provides best tradeoff
+- Use preserve_rng_state=True if deterministic output is required
+
+GOTCHAS:
+--------
+- AC must be applied BEFORE FSDP wrapping
+- AC increases training time by ~10-33% depending on mode
+- AC with torch.compile may change which mode is optimal
+- Some custom ops may not be compatible with AC
+"""
 
 import os
 from collections import defaultdict
@@ -21,6 +97,7 @@ from torchtitan.config.job_config import ActivationCheckpoint as ACConfig
 from torchtitan.tools.logging import logger
 
 
+# Global counter for layer-selective AC (checkpoint every Nth layer)
 _layer_sac_count = 0
 
 

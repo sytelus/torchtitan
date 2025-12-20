@@ -4,6 +4,110 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+TorchTitan Job Configuration System
+=====================================
+
+This module defines all configuration options for TorchTitan training jobs.
+Configuration is organized into nested dataclasses, each handling a specific
+aspect of training.
+
+CONFIGURATION SECTIONS:
+-----------------------
+1. **Job**: Basic job settings (dump folder, description, config file)
+2. **Model**: Model selection and HuggingFace assets path
+3. **Training**: Core training hyperparameters (batch size, seq_len, steps)
+4. **Optimizer**: Optimizer type and parameters (AdamW, lr, betas)
+5. **LRScheduler**: Learning rate schedule (warmup, decay type)
+6. **Parallelism**: All parallelism degrees (DP, TP, PP, CP, EP)
+7. **Checkpoint**: Checkpointing settings (interval, async mode, HF format)
+8. **ActivationCheckpoint**: Memory optimization via recomputation
+9. **Compile**: torch.compile settings
+10. **Quantize**: FP8 and MX training settings
+11. **Comm**: Distributed communication settings (timeouts, flight recorder)
+12. **Profiling**: PyTorch profiler settings
+13. **Metrics**: Logging settings (TensorBoard, W&B)
+14. **FaultTolerance**: TorchFT elastic training settings
+15. **Validation**: Validation during training
+16. **Debug**: Debugging options (determinism, seeds)
+
+CONFIGURATION LOADING:
+----------------------
+Configuration can be provided via:
+1. TOML config file (--job.config_file)
+2. Command-line arguments (--section.option value)
+3. Environment variables (TORCHTITAN_SECTION_OPTION)
+
+Command-line args override TOML file, which overrides environment variables.
+
+EXAMPLE TOML CONFIG:
+--------------------
+```toml
+[job]
+description = "Llama 8B training run"
+dump_folder = "./outputs/llama_8b"
+
+[model]
+name = "llama3"
+flavor = "8B"
+
+[training]
+local_batch_size = 8
+global_batch_size = 1024
+seq_len = 4096
+steps = 100000
+
+[parallelism]
+tensor_parallel_degree = 2
+data_parallel_shard_degree = -1  # auto-calculate
+
+[checkpoint]
+enable = true
+interval = 1000
+async_mode = "async_with_pinned_mem"
+```
+
+EXAMPLE COMMAND LINE:
+---------------------
+```bash
+torchrun --nproc_per_node=8 train.py \
+    --job.config_file config.toml \
+    --training.steps 50000 \
+    --optimizer.lr 1e-4
+```
+
+KEY CONFIGURATION DECISIONS:
+----------------------------
+1. **Batch Size**: global_batch_size = local_batch_size * dp_degree * grad_accum
+   - Set global_batch_size=-1 for auto (uses local_batch_size * dp_degree)
+
+2. **Parallelism Degrees**: pp * tp * dp_shard * dp_replicate = world_size
+   - Set dp_shard=-1 for auto (uses remaining GPUs)
+   - For HSDP: dp_replicate > 1 AND dp_shard > 1
+
+3. **Mixed Precision**: training.dtype controls parameter storage
+   - dtype=bfloat16: Pure BF16 training (no master weights)
+   - dtype=float32 + mixed_precision_param=bfloat16: Mixed precision
+
+4. **Activation Checkpointing Modes**:
+   - "selective": Checkpoint every Nth layer
+   - "full": Checkpoint all activations
+   - "memory_budget": Compiler-guided checkpointing
+   - "none": No checkpointing
+
+5. **FP8 Training**: Set model.converters = ["quantize.linear.float8"]
+   - Requires H100/H800 (SM89+)
+   - Enable enable_fsdp_float8_all_gather for FSDP communication savings
+
+TIPS AND GOTCHAS:
+-----------------
+- seq_len must be divisible by (tp_degree * 2 * cp_degree)
+- For PP: local_batch_size must be divisible by pipeline_parallel_microbatch_size
+- For FSDP: enable_cpu_offload moves optimizer states to CPU (slower but less GPU RAM)
+- gc_freq controls garbage collection frequency (prevents stragglers)
+- After first step, comm timeout is reduced (train_timeout_seconds)
+"""
+
 import json
 import os
 from dataclasses import asdict, dataclass, field
@@ -702,6 +806,7 @@ class Compile:
     components: list[str] = field(default_factory=lambda: ["model", "loss"])
     """Which components to compile"""
     backend: str = "inductor"
+    """torch.compile backend to use (e.g., 'inductor')."""
 
 
 @dataclass

@@ -4,6 +4,96 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+ParallelDims - Device Mesh Management for Multi-Dimensional Parallelism
+========================================================================
+
+This module provides the `ParallelDims` class that manages the mapping between
+physical GPUs and logical parallelism dimensions. Understanding this module is
+key to understanding how TorchTitan combines multiple parallelism strategies.
+
+DEVICE MESH CONCEPT:
+--------------------
+A device mesh is a multi-dimensional array of devices (GPUs). Each dimension
+corresponds to a parallelism strategy. For example, with 16 GPUs:
+
+    Physical GPUs: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+    With TP=2, PP=2, DP=4, the mesh is reshaped to:
+
+    PP dimension (2 stages):
+    ├── Stage 0: GPUs [0-7]
+    └── Stage 1: GPUs [8-15]
+
+    Within each PP stage, TP dimension (2 ways):
+    ├── TP group 0: [0,1], [4,5], ...
+    └── TP group 1: [2,3], [6,7], ...
+
+    DP dimension (4 ways): Process different data
+    └── [0,8], [1,9], [2,10], [3,11], [4,12], [5,13], [6,14], [7,15]
+
+PARALLELISM DIMENSIONS:
+-----------------------
+- **pp (Pipeline Parallel)**: Different transformer layers on different GPUs.
+  Communication: Send/recv activations between stages.
+
+- **tp (Tensor Parallel)**: Split weight matrices across GPUs.
+  Communication: All-reduce or reduce-scatter within each layer.
+
+- **dp_shard (FSDP)**: Shard parameters across GPUs, all-gather before compute.
+  Communication: All-gather (forward), reduce-scatter (backward).
+
+- **dp_replicate (DDP)**: Replicate parameters, average gradients.
+  Communication: All-reduce gradients after backward.
+
+- **cp (Context Parallel)**: Split sequence dimension across GPUs.
+  Communication: Ring attention pattern during attention.
+
+- **ep (Expert Parallel)**: Different MoE experts on different GPUs.
+  Communication: All-to-all for routing tokens to experts.
+
+- **etp (Expert Tensor Parallel)**: TP within expert layers.
+
+MESH HIERARCHY:
+---------------
+The mesh dimensions are organized hierarchically for efficiency:
+
+    world_mesh
+    ├── dataloading_mesh: [pp, batch, cp, tp]
+    │   └── Used for data sharding and loading
+    ├── dense_mesh: [pp, dp_replicate, fsdp, tp]
+    │   └── For dense (non-expert) layers
+    └── sparse_mesh: [pp, dp_replicate, efsdp, ep, etp]
+        └── For sparse (MoE expert) layers
+
+HSDP (Hybrid Sharded Data Parallel):
+------------------------------------
+When both dp_replicate > 1 and dp_shard > 1, we get HSDP:
+- dp_shard: FSDP-style sharding within a group (intra-node typically)
+- dp_replicate: DDP-style replication across groups (inter-node typically)
+
+This provides a balance: reduce memory with FSDP within nodes,
+reduce communication with DDP across nodes.
+
+EXAMPLE CONFIGURATIONS:
+-----------------------
+1. Simple FSDP (8 GPUs):
+   ParallelDims(dp_shard=8, ...)  # Each GPU holds 1/8 of model
+
+2. FSDP + TP (8 GPUs, TP=2):
+   ParallelDims(dp_shard=4, tp=2, ...)  # 4-way FSDP, 2-way TP
+
+3. Full 3D (32 GPUs):
+   ParallelDims(dp_shard=4, tp=2, pp=4, ...)  # 4 DP, 2 TP, 4 PP stages
+
+GOTCHAS:
+--------
+- dp_shard=-1 means "auto": use remaining GPUs after other dimensions
+- Total product of all dimensions must equal world_size
+- When CP is enabled, FSDP is implicitly enabled (fsdp = dp_shard * cp)
+- Sequence length must be divisible by (tp * cp * 2) for proper sharding
+"""
+
 from dataclasses import dataclass, field
 
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -17,22 +107,89 @@ __all__ = ["ParallelDims"]
 
 @dataclass
 class ParallelDims:
-    dp_replicate: int
-    dp_shard: int
-    cp: int
-    tp: int
-    pp: int
-    ep: int
-    etp: int
-    world_size: int
+    """
+    Manages parallelism dimensions and device mesh for distributed training.
 
+    This class handles the creation and management of device meshes for various
+    parallelism strategies. It validates dimension configurations and provides
+    convenient access to sub-meshes for each parallelism type.
+
+    Attributes:
+        dp_replicate (int): DDP replication degree. Each replica holds full model
+            and averages gradients. Set > 1 for HSDP (hybrid with FSDP).
+            Default: 1 (no DDP replication).
+
+        dp_shard (int): FSDP sharding degree. Model parameters are sharded across
+            this many GPUs. Set to -1 for "auto" (use remaining GPUs).
+            Each GPU holds 1/dp_shard of the model parameters.
+            Default: -1 (auto-calculate from remaining world_size).
+
+        cp (int): Context Parallel degree. Sequence dimension is split across
+            this many GPUs. Requires ring attention implementation.
+            Default: 1 (no context parallelism).
+
+        tp (int): Tensor Parallel degree. Weight matrices are split across
+            this many GPUs (column-wise or row-wise).
+            Default: 1 (no tensor parallelism).
+
+        pp (int): Pipeline Parallel degree. Model layers are distributed across
+            this many stages, each stage on different GPUs.
+            Default: 1 (no pipeline parallelism).
+
+        ep (int): Expert Parallel degree for MoE models. Experts are distributed
+            across this many groups. Default: 1 (no expert parallelism).
+
+        etp (int): Expert Tensor Parallel degree. TP within expert layers.
+            Must be either 1 or equal to tp. Default: 1.
+
+        world_size (int): Total number of GPUs/processes. Must equal the product
+            of all parallelism dimensions: dp_replicate * dp_shard * cp * tp * pp.
+
+    Example:
+        >>> # 8 GPU setup with 4-way FSDP and 2-way TP
+        >>> dims = ParallelDims(
+        ...     dp_replicate=1, dp_shard=4, cp=1, tp=2, pp=1, ep=1, etp=1,
+        ...     world_size=8
+        ... )
+        >>> dims.build_mesh()
+        >>> tp_mesh = dims.get_mesh("tp")  # Get TP sub-mesh for parallelization
+    """
+
+    # =========================================================================
+    # PARALLELISM DIMENSION PARAMETERS
+    # =========================================================================
+    dp_replicate: int  # DDP-style replication (for HSDP)
+    dp_shard: int      # FSDP-style sharding (-1 = auto)
+    cp: int            # Context/Sequence parallel
+    tp: int            # Tensor parallel
+    pp: int            # Pipeline parallel
+    ep: int            # Expert parallel (MoE)
+    etp: int           # Expert tensor parallel
+    world_size: int    # Total number of processes
+
+    # =========================================================================
+    # INTERNAL STATE
+    # =========================================================================
     _meshes: dict[str, DeviceMesh] = field(default_factory=dict)
     _world_mesh: DeviceMesh | None = None
 
     def __post_init__(self):
+        """Validate dimensions after initialization."""
         self._validate()
 
     def _validate(self):
+        """
+        Validate parallelism dimension configuration.
+
+        This method ensures:
+        1. All dimensions (except dp_shard) are >= 1
+        2. dp_shard is either -1 (auto) or >= 1
+        3. Product of dimensions equals world_size
+        4. Expert TP is compatible with regular TP
+
+        Raises:
+            AssertionError: If any validation fails
+        """
         dp_replicate, dp_shard, cp, tp, pp, ep, etp = (
             self.dp_replicate,
             self.dp_shard,
@@ -42,27 +199,53 @@ class ParallelDims:
             self.ep,
             self.etp,
         )
+
+        # All dimensions must be at least 1 (except dp_shard which can be -1 for auto)
         for d in (dp_replicate, cp, tp, pp, ep, etp):
             assert d >= 1, "Parallelism degree should be >= 1, except for dp_shard"
 
+        # dp_shard = -1 means "auto-calculate from remaining GPUs"
         assert dp_shard == -1 or dp_shard >= 1, "dp_shard must -1 or >=1."
         if dp_shard < 0:
+            # AUTO MODE: Use remaining GPUs after accounting for other dimensions.
+            # Example: world_size=16, dp_replicate=2, tp=2, pp=2, cp=1
+            #          -> dp_shard = 16 / (2 * 1 * 2 * 2) = 2
             self.dp_shard = dp_shard = self.world_size // (dp_replicate * cp * tp * pp)
         assert dp_shard >= 1
 
+        # CRITICAL: Product of all dimensions must equal world_size
+        # This ensures every GPU is assigned exactly one role in each dimension
         assert dp_replicate * dp_shard * cp * tp * pp == self.world_size, (
             f"Invalid parallel dims: dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * "
             f"cp({cp}) * tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
         )
 
+        # Expert TP restriction: must match regular TP or be disabled
+        # This simplifies the mesh construction for MoE layers
         if ep > 1:
             assert etp == tp or etp == 1, "Currently we only support ETP=TP or ETP=1"
 
     def _mesh_exist(self, name: str, degree: int) -> bool:
+        """
+        Check if a mesh dimension should be created (i.e., is actively used).
+
+        A mesh dimension "exists" and should have a real (not fake) backend if:
+        - Its degree is > 1 (parallelism is actually enabled), OR
+        - It's 'efsdp' and EP > 1 (needed for mixed precision in MoE layers)
+
+        Args:
+            name: Name of the mesh dimension
+            degree: Size of the mesh dimension
+
+        Returns:
+            bool: True if this mesh dimension should be created with real backend
+        """
         if name == "efsdp":
-            # We always keep the efsdp if EP is larger than 1 because we need
-            # FSDP wrapping to help the MoE layers do mixed precision training.
+            # Special case: efsdp (FSDP for expert regions) is needed even if
+            # size is 1 when EP > 1, because FSDP wrapping enables mixed precision
+            # training for MoE layers.
             return True if self.ep > 1 else False
+        # For all other dimensions, only create if degree > 1 (parallelism active)
         return degree > 1
 
     def build_mesh(self) -> DeviceMesh:
@@ -134,6 +317,7 @@ class ParallelDims:
         batch = self.dp_replicate * self.dp_shard
         fsdp = self.dp_shard * self.cp
         efsdp = fsdp * self.tp // (self.etp * self.ep)
+        # efsdp is the FSDP mesh size for expert regions (EP/ETP).
 
         self._world_mesh = init_device_mesh(
             device_type, (self.world_size,), mesh_dim_names=("world",)

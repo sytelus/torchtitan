@@ -4,8 +4,95 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# This file applies the PT-D parallelisms (except pipeline parallelism) and various
-# training techniques (e.g. activation checkpointing and compile) to the Llama model.
+"""
+Model Parallelization for Llama3
+================================
+
+This file applies PyTorch Distributed (PT-D) parallelisms and training optimizations
+to the Llama model. It serves as the reference implementation for how to parallelize
+transformer models in TorchTitan.
+
+ORDER OF PARALLELIZATION:
+-------------------------
+The parallelization is applied in a specific order for correctness:
+
+1. **Tensor Parallelism (TP)**: Applied first because it modifies module structure
+   and wraps parameters with DTensor. Must happen before other wrappers.
+
+2. **Activation Checkpointing (AC)**: Applied after TP but before FSDP.
+   This wraps modules to recompute activations during backward, reducing memory.
+   Must be before FSDP so checkpointed modules are wrapped once.
+
+3. **torch.compile**: Applied after AC because:
+   - Compile captures the AC-wrapped graph
+   - Per-block compilation is more efficient than whole-model compilation
+   - Must be before FSDP to compile the local (un-sharded) module
+
+4. **FSDP/DDP**: Applied last because it wraps the entire model.
+   - FSDP shards parameters and requires all modifications to be complete
+   - DDP wraps for gradient synchronization
+
+TENSOR PARALLELISM EXPLAINED:
+-----------------------------
+For each transformer block, we apply TP to split computations across GPUs:
+
+    Input: [batch, seq, hidden]
+           |
+    SequenceParallel(attention_norm)  # Keep seq sharded
+           |
+    PrepareModuleInput(Shard(1) -> Replicate)  # Gather seq for attention
+           |
+    ColwiseParallel(wq, wk, wv)  # Split heads across TP ranks
+           |
+    Attention computation (local)
+           |
+    RowwiseParallel(wo)  # Combine partial outputs, output Shard(1)
+           |
+    SequenceParallel(ffn_norm)
+           |
+    ColwiseParallel(w1, w3)  # Split FFN intermediate
+           |
+    RowwiseParallel(w2)  # Combine, output Shard(1)
+           |
+    Output: [batch, seq, hidden] (sharded on seq)
+
+SEQUENCE PARALLELISM:
+---------------------
+Between TP operations, activations are sharded on the sequence dimension.
+This reduces memory without extra communication (the existing TP comms
+naturally transform between Replicate and Shard(seq)).
+
+FSDP2 EXPLAINED:
+----------------
+FSDP (Fully Sharded Data Parallel) shards parameters across ranks:
+
+    Before forward:
+    - Parameters: sharded (each rank has 1/N of params)
+
+    During forward (for each FSDP unit):
+    - All-gather: Collect full params from all ranks
+    - Compute forward with full params
+    - Optionally reshard (free the gathered params)
+
+    During backward:
+    - All-gather params if resharded
+    - Compute gradients
+    - Reduce-scatter: Each rank gets its shard of gradients
+
+KEY CONFIGURATION OPTIONS:
+--------------------------
+- reshard_after_forward="default": Don't reshard for PP (avoids per-microbatch all-gathers)
+- cpu_offload=True: Move params/grads/optimizer to CPU (slower but less GPU memory)
+- mp_policy: Controls param/reduce dtypes for mixed precision
+
+GOTCHAS:
+--------
+1. seq_len must be divisible by (tp_degree * 2 * cp_degree) for proper sharding
+2. TP with FP8 requires special parallel styles (Float8ColwiseParallel, etc.)
+3. For PP, don't reshard after forward (expensive per-microbatch all-gathers)
+4. The model must be on meta device for efficient parallelization
+5. loss_parallel shards the vocab dimension for memory savings
+"""
 
 import torch
 import torch.nn as nn
@@ -30,19 +117,27 @@ from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.tools.logging import logger
 
 
-# for selective op activation checkpointing
+# =============================================================================
+# SELECTIVE OP ACTIVATION CHECKPOINTING
+# These operations are expensive (compute or memory) and should be saved
+# rather than recomputed during backward pass in selective AC mode.
+# =============================================================================
 _op_sac_save_list = {
+    # Matrix multiplications - expensive to recompute
     torch.ops.aten.mm.default,
+    # Attention ops - these are the most expensive operations
     torch.ops.aten._scaled_dot_product_efficient_attention.default,
     torch.ops.aten._scaled_dot_product_flash_attention.default,
     torch.ops.aten._scaled_dot_product_cudnn_attention.default,
     torch.ops.aten._scaled_dot_product_attention_math.default,
     torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default,
+    # Communication ops - must preserve for correct distributed behavior
     torch.ops._c10d_functional.reduce_scatter_tensor.default,
-    # for low precision training, it's useful to always save
-    # the result of max, since the absolute maximum is
-    # used to compute the scaling factor for quantization.
+    # For low precision training (FP8), always save max values since
+    # the absolute maximum is used to compute scaling factors.
+    # Recomputing could give slightly different results causing NaN.
     torch.ops.aten.max.default,
+    # Higher-order ops that shouldn't be recomputed
     torch._higher_order_ops.flex_attention,
     torch.ops.torch_attn._varlen_attn.default,
     torch._higher_order_ops.inductor_compiled_code,
@@ -58,12 +153,29 @@ def parallelize_llama(
     Apply tensor parallelism, activation checkpointing, torch.compile, and data
     parallelism to the model.
 
+    This is the main entry point for model parallelization. It orchestrates
+    the application of all parallelism strategies in the correct order:
+    TP -> AC -> compile -> FSDP/DDP
+
+    Args:
+        model: The model to parallelize. Should be on meta device for efficiency.
+        parallel_dims: Configuration for all parallelism dimensions.
+        job_config: Complete job configuration with training settings.
+
+    Returns:
+        nn.Module: The parallelized model, ready for distributed training.
+
     NOTE: The passed-in model preferably should be on meta device. Otherwise,
-    the model must fit on GPU or CPU memory.
+    the model must fit on GPU or CPU memory. Using meta device allows the
+    parallelization to set up DTensor wrappers without allocating memory.
     """
-    # TODO: TP currently cannot handle uneven seq_len because we set
-    #       `use_local_output=True` to use plain Tensors for legacy reasons.
-    #       Need to revisit this.
+    # =========================================================================
+    # SEQUENCE LENGTH VALIDATION
+    # For TP + CP, sequence length must be evenly divisible for proper sharding.
+    # seq_len_divisor = tp * (cp * 2) because:
+    # - TP splits heads, requiring even division
+    # - CP splits sequence, with load balancing requiring factor of 2
+    # =========================================================================
     assert (
         job_config.training.seq_len % parallel_dims.seq_len_divisor == 0
     ), f"""
@@ -71,6 +183,11 @@ def parallelize_llama(
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
 
+    # =========================================================================
+    # STEP 1: TENSOR PARALLELISM
+    # Applied first because it modifies the module structure by wrapping
+    # parameters with DTensor. Other wrappers (AC, FSDP) work with this structure.
+    # =========================================================================
     if parallel_dims.tp_enabled:
         enable_float8_linear = "float8" in job_config.model.converters
         float8_is_rowwise = job_config.quantize.linear.float8.recipe_name in (
@@ -96,6 +213,12 @@ def parallelize_llama(
         job_config.compile.enable and "model" in job_config.compile.components
     )
 
+    # =========================================================================
+    # STEP 2: ACTIVATION CHECKPOINTING
+    # Applied after TP but before FSDP/compile for correct wrapping order.
+    # AC reduces memory by recomputing activations during backward instead
+    # of storing them. The _op_sac_save_list specifies expensive ops to save.
+    # =========================================================================
     if job_config.activation_checkpoint.mode != "none":
         apply_ac(
             model,
@@ -105,11 +228,24 @@ def parallelize_llama(
             op_sac_save_list=_op_sac_save_list,
             base_folder=job_config.job.dump_folder,
         )
+        # AC is applied before FSDP so that checkpointed modules are wrapped once.
+        # If applied after FSDP, each shard would be wrapped separately, which
+        # would be incorrect.
 
-    # turn on per-TransformerBlock compile after AC wrapping and before FSDP
+    # =========================================================================
+    # STEP 3: TORCH.COMPILE
+    # Applied per-TransformerBlock for efficiency. Whole-model compilation is
+    # slower and less effective due to the repeated structure not being exploited.
+    # Must be before FSDP because compile works on the local (un-sharded) module.
+    # =========================================================================
     if model_compile_enabled:
         apply_compile(model, job_config.compile)
 
+    # =========================================================================
+    # STEP 4: DATA PARALLELISM (FSDP or DDP)
+    # Applied last because it wraps the entire model for distributed training.
+    # FSDP shards parameters; DDP replicates and syncs gradients.
+    # =========================================================================
     if parallel_dims.fsdp_enabled:
         # dp_mesh is the mesh for FSDP/HSDP
         names = (

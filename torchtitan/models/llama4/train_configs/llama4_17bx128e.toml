@@ -1,4 +1,5 @@
 # TODO: this toml config is still under development
+# For a full option list and defaults, see docs/config_reference.md.
 
 [job]
 dump_folder = "./outputs"

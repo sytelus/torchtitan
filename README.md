@@ -42,6 +42,11 @@ The Guiding Principles when building `torchtitan`
 
 `torchtitan` has been showcasing PyTorch's latest distributed training features, via support for pretraining Llama 3.1 LLMs of various sizes.
 
+### New here? Start with these docs
+* [Architecture and code tour](docs/architecture.md)
+* [Parallelism primer](docs/parallelism_primer.md)
+* [Config reference](docs/config_reference.md)
+
 ## Contributing
 
 We look forward to your contributions!

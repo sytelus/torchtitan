@@ -3,6 +3,80 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+
+"""
+FP8 (8-bit Floating Point) Training Support
+=============================================
+
+This module implements FP8 training support for TorchTitan using the torchao library.
+FP8 training uses 8-bit floating point formats for matrix multiplications during
+forward and backward passes, reducing memory bandwidth and enabling tensor core
+acceleration on supported hardware.
+
+FP8 FORMATS OVERVIEW:
+---------------------
+FP8 uses two main formats optimized for different use cases:
+- E4M3 (4 exponent bits, 3 mantissa): Higher precision, smaller range. Used for activations/weights.
+- E5M2 (5 exponent bits, 2 mantissa): Lower precision, larger range. Used for gradients.
+
+DYNAMIC SCALING:
+----------------
+FP8 has a very limited dynamic range (~240 for E4M3 vs ~65504 for FP16).
+To prevent overflow/underflow, values are scaled before FP8 conversion:
+
+    fp8_value = original_value * scale_factor
+
+The scale factor is computed dynamically based on the absolute maximum (amax)
+of the tensor, ensuring values fit within FP8 range.
+
+TWO SCALING APPROACHES:
+-----------------------
+1. **Delayed Scaling**: Scale is computed from previous iteration's amax (cached).
+   - Lower overhead (no extra reduction in forward pass)
+   - May cause overflow if values change rapidly between iterations
+
+2. **Dynamic Scaling (Default)**: Scale computed from current tensor's amax.
+   - More accurate but requires extra reduce operations
+   - Recommended for most training scenarios
+
+FSDP FLOAT8 ALL-GATHER OPTIMIZATION:
+------------------------------------
+When FSDP is enabled, weights are normally all-gathered in FP16/BF16.
+With `enable_fsdp_float8_all_gather`, weights are:
+1. Stored in FP8 format (8 bytes per element instead of 16)
+2. All-gathered in FP8 (halves communication volume)
+3. Converted to higher precision just before compute
+
+This significantly reduces communication time for FSDP workloads.
+
+RECIPES:
+--------
+Recipes are pre-configured FP8 settings optimized for different scenarios:
+- "tensorwise": Standard FP8 with per-tensor scaling (default)
+- "rowwise": Per-row scaling for better accuracy (requires specific hardware)
+
+HARDWARE REQUIREMENTS:
+----------------------
+- SM89+ (H100, H800) for native FP8 compute
+- Older hardware can use `emulate=True` for testing (very slow)
+
+USAGE:
+------
+Enable in config:
+```toml
+[quantize.linear.float8]
+enable = true
+enable_fsdp_float8_all_gather = true  # For FSDP communication savings
+```
+
+GOTCHAS:
+--------
+1. FP8 is experimental; expect accuracy differences from FP16/BF16 training
+2. Not all layers benefit from FP8 (small layers may be slower due to overhead)
+3. Use `filter_fqns` to exclude specific layers from FP8 conversion
+4. Recipe "rowwise" requires inductor config for precision cast emulation
+"""
+
 from functools import partial
 
 import torch
@@ -22,11 +96,49 @@ from torchtitan.tools.utils import has_cuda_capability
 
 from .utils import module_filter_fn
 
+# Flag for automatic filtering of small layers that don't benefit from FP8
 AUTO_FILTER_SMALL_KN_FLAG = "auto_filter_small_kn"
 
 
 class Float8LinearConverter(QuantizationConverter):
+    """
+    Model converter that replaces nn.Linear layers with Float8Linear.
+
+    This converter enables FP8 training by swapping standard Linear layers
+    with FP8-compatible versions from torchao. The FP8 Linear layers perform
+    matrix multiplications in 8-bit floating point format, reducing memory
+    bandwidth and enabling tensor core acceleration.
+
+    The converter supports two modes:
+    1. Recipe-based: Use pre-configured recipes (e.g., "tensorwise", "rowwise")
+    2. Manual configuration: Set individual FP8 options
+
+    Attributes:
+        enabled (bool): Whether FP8 conversion is enabled
+        config: TorchAO Float8LinearConfig with FP8 settings
+        precompute_scale (bool): Whether to precompute scales for FSDP
+        filter_fqns (list): Module FQNs to exclude from conversion
+        filter_fn (callable): Function to filter which modules to convert
+
+    Example:
+        ```python
+        converter = Float8LinearConverter(job_config, parallel_dims)
+        converter.convert(model)  # Replaces Linear -> Float8Linear
+        ```
+    """
+
     def __init__(self, job_config: JobConfig, parallel_dims: ParallelDims):
+        """
+        Initialize the Float8 converter.
+
+        Args:
+            job_config: Training configuration with FP8 settings
+            parallel_dims: Parallelism configuration (needed for FSDP awareness)
+
+        Raises:
+            ValueError: If hardware doesn't support FP8 and emulation is disabled
+            ImportError: If torchao is not installed
+        """
         super().__init__(job_config, parallel_dims)
         float8_config: Float8Linear = job_config.quantize.linear.float8
         compile_config = job_config.compile
@@ -34,6 +146,12 @@ class Float8LinearConverter(QuantizationConverter):
             compile_config.enable and "model" in compile_config.components
         )
 
+        # =====================================================================
+        # HARDWARE CHECK
+        # FP8 compute requires SM89+ (H100, H800). For older hardware,
+        # emulation mode can be used for testing (very slow, not for production).
+        # Note: Emulation only works in eager mode, not with torch.compile.
+        # =====================================================================
         if has_cuda_capability(8, 9) or (
             float8_config.emulate and not model_compile_enabled
         ):
@@ -63,6 +181,7 @@ class Float8LinearConverter(QuantizationConverter):
         self.filter_fn = self._init_filter_fn(float8_config)
 
         if float8_config.recipe_name is not None:
+            # Recipes encapsulate scaling/format choices; they override explicit flags.
             assert not float8_config.enable_fsdp_float8_all_gather, (
                 "using `float8_config.enable_fsdp_float8_all_gather` together "
                 "with `float8_config.recipe_name` is not supported"

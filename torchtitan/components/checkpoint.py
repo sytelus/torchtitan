@@ -4,6 +4,105 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+Distributed Checkpointing for TorchTitan
+=========================================
+
+This module provides checkpoint management for distributed training using
+PyTorch's Distributed Checkpoint (DCP) library. It handles saving and loading
+of model weights, optimizer states, LR scheduler states, and training state
+across distributed ranks.
+
+KEY FEATURES:
+-------------
+1. **Distributed Checkpoint (DCP)**: Each rank saves/loads only its shard of
+   the state dict, avoiding memory pressure and enabling very large models.
+
+2. **Async Checkpointing**: Three modes to balance save speed vs. memory:
+   - "disabled": Synchronous save (blocks training)
+   - "async": Background save using threads
+   - "async_with_pinned_mem": Fastest, uses pinned CPU memory + separate process
+
+3. **HuggingFace Format Support**: Export checkpoints in safetensors format
+   compatible with HuggingFace Transformers.
+
+4. **Fault Tolerance (TorchFT)**: Special handling for elastic training where
+   replicas may fail/rejoin.
+
+5. **Automatic Cleanup**: Configurable `keep_latest_k` to auto-delete old
+   checkpoints and prevent disk from filling up.
+
+CHECKPOINT STRUCTURE:
+---------------------
+```
+{dump_folder}/{checkpoint.folder}/
+├── step-1000/
+│   ├── __0_0.distcp  # Rank 0 shard
+│   ├── __0_1.distcp  # Rank 1 shard
+│   ├── ...
+│   └── .metadata     # Distributed metadata
+├── step-2000/
+│   └── ...
+└── step-final/       # Last checkpoint (may be HF format)
+    ├── model.safetensors
+    └── model.safetensors.index.json
+```
+
+WHAT'S SAVED:
+-------------
+- **model**: All model parameters (DTensor-aware for sharding)
+- **optimizer**: Optimizer states (momentum, variance for Adam, etc.)
+- **lr_scheduler**: Current learning rate schedule position
+- **dataloader**: Iterator position (for exact resumption)
+- **train_state**: Custom training state (step count, tokens seen)
+
+ASYNC CHECKPOINTING:
+--------------------
+Standard synchronous checkpointing can block training for minutes with large
+models. Async modes solve this:
+
+1. **async**: Uses Python threads to write in background.
+   - Training continues while writing
+   - Still uses GPU memory for staging
+
+2. **async_with_pinned_mem**: Uses pinned CPU memory + separate process.
+   - Copy to pinned CPU memory (fast)
+   - Separate process writes to disk
+   - Training can modify weights immediately after staging
+   - Highest throughput but uses more CPU memory
+
+PIPELINE PARALLEL CHALLENGES:
+-----------------------------
+With PP, each rank has different layers, but optimizer indexing is per-rank:
+- Rank 0 optimizer has param_group[0] for layers.0
+- Rank 1 optimizer has param_group[0] for layers.4
+
+This would cause collisions when saving. Solution: Optimizer flattening
+converts relative indices to absolute FQNs, avoiding collisions.
+
+HUGGINGFACE FORMAT:
+-------------------
+Set `last_save_in_hf=True` to export final checkpoint in HF format:
+- Converts to HF model state dict format
+- Saves as safetensors (safe, fast loading)
+- Compatible with HF Transformers library
+
+RESUMPTION:
+-----------
+Checkpoints enable training resumption:
+1. Load checkpoint at step N
+2. Restore model weights, optimizer states, LR scheduler
+3. Restore dataloader position (exact data resumption)
+4. Continue training from step N+1
+
+TIPS:
+-----
+- Use `async_with_pinned_mem` for production training (near-zero overhead)
+- Set `keep_latest_k=10` to auto-cleanup old checkpoints
+- Use `enable_first_step_checkpoint=True` to verify checkpointing works early
+- For debugging, use `load_step=N` to load a specific checkpoint
+"""
+
 import enum
 import functools
 import os
@@ -45,11 +144,15 @@ from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
 
 
-MODEL = "model"
-OPTIMIZER = "optimizer"
-LR_SCHEDULER = "lr_scheduler"
-DATALOADER = "dataloader"
-TRAIN_STATE = "train_state"
+# =============================================================================
+# STATE DICT KEYS
+# These are the top-level keys in the checkpoint state dict
+# =============================================================================
+MODEL = "model"           # Model parameters
+OPTIMIZER = "optimizer"   # Optimizer states (momentum, variance)
+LR_SCHEDULER = "lr_scheduler"  # LR scheduler state
+DATALOADER = "dataloader"      # Dataloader iterator position
+TRAIN_STATE = "train_state"    # Custom training state (step, tokens_seen)
 
 
 class AsyncMode(str, enum.Enum):

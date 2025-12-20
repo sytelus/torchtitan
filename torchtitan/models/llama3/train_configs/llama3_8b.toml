@@ -1,4 +1,6 @@
 # NOTE: this toml config is a preset for 64 A100 GPUs.
+# For a full option list and defaults, see docs/config_reference.md.
+# For parallelism concepts, see docs/parallelism_primer.md.
 
 [job]
 dump_folder = "./outputs"
@@ -37,6 +39,7 @@ dataset = "c4"
 
 [parallelism]
 data_parallel_replicate_degree = 1
+# -1 means \"use leftover ranks\" after other dimensions (FSDP by default here).
 data_parallel_shard_degree = -1
 tensor_parallel_degree = 1
 pipeline_parallel_degree = 1

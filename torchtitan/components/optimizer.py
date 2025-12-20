@@ -4,6 +4,81 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+Optimizer Management for Distributed Training
+==============================================
+
+This module provides optimizer containers and builders for distributed LLM training.
+It handles the complexity of optimizing models across multiple parallelism dimensions,
+particularly Pipeline Parallelism where each rank may have multiple model chunks.
+
+KEY CONCEPTS:
+-------------
+1. **OptimizersContainer**: Wraps multiple optimizers (one per model part) to provide
+   a unified interface. This is necessary for Pipeline Parallelism where each rank
+   owns different model chunks.
+
+2. **Optimizer State Flattening**: For checkpointing with PP, optimizer states must
+   be "flattened" - converting per-rank indices to global FQNs to avoid collisions.
+   Without flattening, Rank 0's param_group[0] and Rank 1's param_group[0] would
+   overwrite each other in the checkpoint.
+
+3. **Optimizer in Backward**: An optimization where optimizer.step() is called
+   immediately after each parameter's gradient is computed, rather than waiting
+   for all gradients. This can improve memory efficiency but has limitations.
+
+OPTIMIZER IMPLEMENTATIONS:
+--------------------------
+Three optimizer implementations are supported:
+- "fused": Uses CUDA fused kernels (fastest, CUDA only)
+- "foreach": Horizontal fusion of operations (good balance)
+- "for-loop": Standard Python loops (slowest, most compatible)
+
+PIPELINE PARALLEL HANDLING:
+---------------------------
+With PP, a single logical model is split across ranks:
+- Rank 0: Layers 0-7
+- Rank 1: Layers 8-15
+- ...
+
+Each rank has its own optimizer for its local parameters. The OptimizersContainer
+coordinates these and handles state dict serialization correctly.
+
+FAULT TOLERANCE (TorchFT):
+--------------------------
+FTOptimizersContainer integrates with TorchFT for elastic training:
+- Caches optimizer state dict for fast recovery
+- Uses ft.Optimizer wrapper for quorum-based step()
+
+MoE LOAD BALANCING:
+-------------------
+For Mixture-of-Experts models, build_optimizers_with_moe_load_balancing adds
+a pre-step hook that adjusts expert biases based on token distribution,
+promoting balanced expert utilization.
+
+USAGE:
+------
+```python
+# Standard optimizer building
+optimizers = build_optimizers(model_parts, optimizer_config, parallel_dims)
+
+# Training loop
+optimizers.zero_grad()
+# ... forward, backward ...
+optimizers.step()
+
+# Checkpointing
+state_dict = optimizers.state_dict()  # Flattened for PP compatibility
+optimizers.load_state_dict(state_dict)
+```
+
+TIPS:
+-----
+- Use "fused" implementation for best performance on CUDA
+- For very large models, consider optimizer in backward to reduce peak memory
+- When using PP, let the framework handle optimizer state dict flattening
+"""
+
 import functools
 from typing import Any, Generic, Iterator, TypeVar
 
