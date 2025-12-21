@@ -57,16 +57,24 @@ world_size = dp_replicate * dp_shard * cp * tp * pp
 
 ## When to use each parallelism
 
-- **FSDP/HSDP**: primary tool to reduce memory usage. Usually the first knob
-  to turn for large models.
-- **TP**: reduces compute per device for large matrix multiplies. Often paired
-  with FSDP for large models.
-- **PP**: useful when the model does not fit even with FSDP/TP. Adds pipeline
-  bubbles and scheduling complexity.
-- **CP**: allows very long context length by sharding sequence length. Useful
-  for long-context models or inference with huge sequence lengths.
-- **EP/ETP**: for MoE models only. Use EP to shard experts and ETP to adjust
-  expert-specific tensor parallelism.
+| Parallelism | Primary Use | When to Enable |
+|-------------|-------------|----------------|
+| **FSDP** | Memory reduction | Model > 8B params, single node |
+| **HSDP** | Memory + throughput | Model fits in single-node FSDP, multi-node training |
+| **TP** | Activation memory, large layers | Model > 70B or hidden_dim > 8K |
+| **PP** | Extreme model sizes | Model > 200B, FSDP+TP insufficient |
+| **CP** | Long context | Sequence length > 8K-16K |
+| **EP/ETP** | MoE models | Sharding experts across devices |
+
+**Quick decision guide**:
+- Start with **FSDP** for any model that doesn't fit on single GPU
+- Add **HSDP** (replicate across nodes) when scaling to multiple nodes
+- Add **TP** when activation memory is tight or model > 70B
+- Add **PP** only when FSDP+TP isn't enough (200B+ models)
+- Add **CP** for long-context training (32K+)
+
+For detailed memory calculations and recommended configurations by model size,
+see [Parallelism Selection Guide](#parallelism-selection-guide-for-llama3-like-models-on-b200-gpus).
 
 ## HSDP: Combining DDP Replication and FSDP Sharding
 
@@ -209,7 +217,7 @@ GPU holds `1/(tp × dp_shard)` of the model within a replica:
 - **Loss parallel**:
   - When TP is enabled, the output is sharded. Loss parallel reduces the loss
     across those shards. Disable only when you know your loss is already global.
-  - See [Loss Parallel](#loss-parallel-with-tensor-parallelism) below for details.
+  - See [Loss Parallel (Requires TP)](#4-loss-parallel-requires-tp) for details.
 
 - **FP8 + TP**:
   - Tensorwise FP8 scaling can use FP8 all-gather with TP.
@@ -382,35 +390,15 @@ vocab=128K and seq=4K in BF16, that's 1GB per sample—loss parallel avoids this
 
 ### Context Parallelism Constraints
 
-CP splits the sequence across GPUs using ring attention.
-
-#### Sequence Length
+CP splits the sequence across GPUs using ring attention. The key constraint:
 
 ```
 Constraint: seq_len % (tp_degree × cp_degree × 2) == 0
 ```
 
-**Why**: The factor of 2 comes from load balancing in ring attention. CP
-processes causal attention by splitting the sequence into chunks, and the ring
-rotation pattern requires balanced chunk sizes:
-
-```
-Ring Attention Load Balancing (cp=4, seq=8192):
-
-Each chunk: 8192 / (4 × 2) = 1024 tokens
-
-The ×2 factor accounts for:
-- Causal masking creates triangular attention patterns
-- Without balancing, early chunks compute more attention than late chunks
-- The factor of 2 ensures work is evenly distributed across ring steps
-```
-
-**Example calculations**:
-- seq_len=4096, tp=1, cp=4: 4096 % (1×4×2) = 4096 % 8 = 0 ✓
-- seq_len=4096, tp=2, cp=2: 4096 % (2×2×2) = 4096 % 8 = 0 ✓
-- seq_len=32768, tp=1, cp=8: 32768 % (1×8×2) = 32768 % 16 = 0 ✓
-- seq_len=1000, tp=1, cp=4: 1000 % 8 = 0 ✓
-- seq_len=1000, tp=2, cp=4: 1000 % 16 = 8 ✗
+The factor of 2 comes from zigzag load balancing for causal attention. For
+a comprehensive explanation of ring attention and why this constraint exists,
+see [Context Parallelism (CP)](#context-parallelism-cp) below.
 
 ### Summary Table
 
@@ -453,84 +441,25 @@ The ×2 factor accounts for:
 
 ## Typical configurations
 
-- **Single GPU debug**:
-  - dp_replicate=1, dp_shard=1, tp=1, pp=1, cp=1
+Quick reference for common setups. For model-specific recommendations, see
+[Parallelism Selection Guide](#parallelism-selection-guide-for-llama3-like-models-on-b200-gpus).
 
-- **8-GPU data parallel**:
-  - dp_replicate=8, dp_shard=1, tp=1, pp=1
-
-- **8-GPU FSDP**:
-  - dp_replicate=1, dp_shard=8, tp=1, pp=1
-
-- **8-GPU HSDP (2x4)**:
-  - dp_replicate=2, dp_shard=4, tp=1, pp=1
-
-- **16-GPU TP+FSDP (4x4)**:
-  - dp_replicate=1, dp_shard=4, tp=4, pp=1
-
-- **Pipeline parallel (4 stages)**:
-  - pp=4, dp_shard=1 or 4 (paired with FSDP), tp=1
+| Setup | dp_replicate | dp_shard | tp | pp | cp | Use Case |
+|-------|--------------|----------|----|----|----|----|
+| Single GPU debug | 1 | 1 | 1 | 1 | 1 | Testing |
+| 8-GPU DDP | 8 | 1 | 1 | 1 | 1 | Small models (<8B) |
+| 8-GPU FSDP | 1 | 8 | 1 | 1 | 1 | Medium models (8-40B) |
+| 8-GPU HSDP (2×4) | 2 | 4 | 1 | 1 | 1 | Multi-node scaling |
+| 16-GPU TP+FSDP | 1 | 4 | 4 | 1 | 1 | Large models (70B) |
+| 32-GPU HSDP+TP | 4 | 4 | 2 | 1 | 1 | 70B on 4 nodes |
+| 128-GPU 3D | 1 | 4 | 8 | 4 | 1 | 405B+ models |
+| 16-GPU CP+FSDP | 1 | 4 | 1 | 1 | 4 | Long context (32K+) |
 
 ## Where these settings live
 
 All parallelism settings live under the `[parallelism]` section in TOML and the
 `JobConfig.parallelism` dataclass. The full option list and defaults are in
 `docs/config_reference.md`.
-
----
-
-## Loss Parallel with Tensor Parallelism
-
-### What Loss Parallel Is
-
-Loss Parallel shards the vocabulary dimension of the final linear layer (the
-"output head") and cross-entropy loss computation across TP ranks.
-
-### Why It Exists
-
-For LLMs, vocabulary size is huge (32K-256K tokens). The output logits tensor
-has shape `[batch, seq, vocab_size]`. This is memory-intensive:
-
-```
-4K seq × 128K vocab × 2 bytes (BF16) = 1GB per sample!
-```
-
-### How It Works
-
-```
-Without Loss Parallel:
-┌──────────────────────────────────────────────────────────────┐
-│ GPU 0: Full logits [batch, seq, 128K vocab]      ← 1GB      │
-│ GPU 1: Full logits [batch, seq, 128K vocab]      ← 1GB      │
-│        Cross-entropy computed on full vocab                  │
-└──────────────────────────────────────────────────────────────┘
-
-With Loss Parallel:
-┌──────────────────────────────────────────────────────────────┐
-│ GPU 0: Partial logits [batch, seq, 64K vocab]    ← 0.5GB    │
-│ GPU 1: Partial logits [batch, seq, 64K vocab]    ← 0.5GB    │
-│        Cross-entropy computed in parallel                    │
-│        Final loss reduced across ranks                       │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### The `disable_loss_parallel` Config Option
-
-Loss parallel **requires** TP to be enabled (that's where the sharding
-happens). The config option `disable_loss_parallel` allows you to turn it OFF
-when TP is on:
-
-```python
-loss_parallel_enabled = (
-    parallel_dims.tp_enabled
-    and not job_config.parallelism.disable_loss_parallel
-)
-```
-
-**When you might disable it**:
-1. **Debugging**: To compare results without loss parallel
-2. **Compatibility**: Some custom loss functions may not support loss parallel
-3. **Small vocab**: If vocabulary is small, the memory benefit is minimal
 
 ---
 
@@ -1184,6 +1113,255 @@ assert seq_len % seq_len_divisor == 0, \
 
 **Rule of thumb**: Target 4K-8K tokens per GPU per CP chunk for optimal
 efficiency. Going below 2K increases communication overhead.
+
+---
+
+## Pipeline Parallelism (PP)
+
+Pipeline Parallelism splits the model **vertically by layers**, assigning different
+layers to different GPUs. This is fundamentally different from FSDP (which shards
+parameters within layers) and TP (which shards individual layers).
+
+### How Pipeline Parallelism Works
+
+With PP, the model is divided into sequential **stages**, and data flows through
+stages as **microbatches**:
+
+```
+Pipeline Parallelism (pp=4, 32 layers):
+
+Stage 0 (GPU 0): Layers 0-7
+    │
+    ▼ activations
+Stage 1 (GPU 1): Layers 8-15
+    │
+    ▼ activations
+Stage 2 (GPU 2): Layers 16-23
+    │
+    ▼ activations
+Stage 3 (GPU 3): Layers 24-31
+    │
+    ▼ loss → backward propagates in reverse
+```
+
+**Key characteristics**:
+- Each stage holds a **contiguous subset of layers**
+- Only **activations** are communicated between stages (not weights)
+- Memory per GPU: `(total_params / pp_degree) + activations`
+- Reduces memory more than FSDP for very large models
+
+### The Pipeline Bubble Problem
+
+The naive approach (one batch at a time) has terrible efficiency:
+
+```
+Naive Pipeline (pp=4, 1 batch):
+
+Time →
+GPU 0: ████████████░░░░░░░░░░░░░░░░░░░░▓▓▓▓▓▓▓▓▓▓▓▓
+GPU 1: ░░░░████████████░░░░░░░░░░░░░░░░░░░░▓▓▓▓▓▓▓▓▓▓▓▓
+GPU 2: ░░░░░░░░████████████░░░░░░░░░░░░░░░░░░░░▓▓▓▓▓▓▓▓▓▓▓▓
+GPU 3: ░░░░░░░░░░░░████████████░░░░░░░░░░░░░░░░░░░░▓▓▓▓▓▓▓▓▓▓▓▓
+
+████ = Forward pass
+▓▓▓▓ = Backward pass
+░░░░ = Idle (bubble)
+```
+
+Most GPUs are idle most of the time! The **bubble ratio** (idle time / total time)
+approaches 1 with this approach.
+
+### Microbatching: Filling the Pipeline
+
+The solution is to split each batch into **microbatches** and pipeline them:
+
+```
+Microbatch Pipelining (pp=4, 4 microbatches):
+
+Time →
+GPU 0: F₀ F₁ F₂ F₃ ░░ ░░ ░░ ░░ B₃ B₂ B₁ B₀
+GPU 1: ░░ F₀ F₁ F₂ F₃ ░░ ░░ ░░ ░░ B₃ B₂ B₁ B₀
+GPU 2: ░░ ░░ F₀ F₁ F₂ F₃ ░░ ░░ ░░ ░░ B₃ B₂ B₁ B₀
+GPU 3: ░░ ░░ ░░ F₀ F₁ F₂ F₃ ░░ B₃ B₂ B₁ B₀
+
+F₀ = Forward microbatch 0
+B₀ = Backward microbatch 0
+░░ = Bubble
+```
+
+**Bubble ratio** = `(pp - 1) / (pp + num_microbatches - 1)`
+
+With 4 stages and 4 microbatches: 3/7 ≈ 43% idle
+With 4 stages and 16 microbatches: 3/19 ≈ 16% idle
+
+**Rule of thumb**: Use at least 4× more microbatches than pipeline stages.
+
+### Pipeline Schedules
+
+Different schedules trade off memory vs efficiency:
+
+#### GPipe (Fill-Drain)
+
+All forward passes first, then all backward passes:
+
+```
+GPipe Schedule (pp=4, 4 microbatches):
+
+GPU 0: F₀ F₁ F₂ F₃ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░ B₃ B₂ B₁ B₀
+GPU 1: ░░ F₀ F₁ F₂ F₃ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░ B₃ B₂ B₁ B₀
+GPU 2: ░░ ░░ F₀ F₁ F₂ F₃ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░ B₃ B₂ B₁ B₀
+GPU 3: ░░ ░░ ░░ F₀ F₁ F₂ F₃ B₃ B₂ B₁ B₀
+
+             Fill ───────────────────── Drain
+```
+
+- **Pro**: Simple to implement
+- **Con**: High peak memory (stores all microbatch activations simultaneously)
+
+#### 1F1B (One Forward One Backward)
+
+Interleaves forward and backward to reduce memory:
+
+```
+1F1B Schedule (pp=4, 8 microbatches):
+
+GPU 0: F₀ F₁ F₂ F₃ F₄ F₅ F₆ F₇ B₇ B₆ B₅ B₄ B₃ B₂ B₁ B₀
+GPU 1: ░░ F₀ F₁ F₂ F₃ B₃ F₄ B₄ F₅ B₅ F₆ B₆ F₇ B₇ B₂ B₁ B₀ ░░
+GPU 2: ░░ ░░ F₀ F₁ B₁ F₂ B₂ F₃ B₃ F₄ B₄ F₅ B₅ F₆ B₆ F₇ B₇ B₀ ░░
+GPU 3: ░░ ░░ ░░ F₀ B₀ F₁ B₁ F₂ B₂ F₃ B₃ F₄ B₄ F₅ B₅ F₆ B₆ F₇ B₇
+                 Steady state (1F1B) ─────────────────
+```
+
+- **Pro**: Memory bounded by `pp` microbatches instead of `num_microbatches`
+- **Pro**: Same bubble ratio as GPipe
+- **Con**: Slightly more complex gradient accumulation
+
+#### Interleaved 1F1B (Looped Schedule)
+
+Assigns non-contiguous layers to each GPU for better efficiency:
+
+```
+Interleaved (pp=4, 2 virtual stages per GPU):
+
+Instead of: GPU0=[0-7], GPU1=[8-15], GPU2=[16-23], GPU3=[24-31]
+
+Interleaved: GPU0=[0-3,16-19], GPU1=[4-7,20-23], GPU2=[8-11,24-27], GPU3=[12-15,28-31]
+              ▲    ▲
+              │    └── Second virtual stage
+              └─────── First virtual stage
+```
+
+- **Pro**: Reduces bubble ratio by factor of `virtual_stages`
+- **Con**: More communication (activations sent multiple times)
+- **Con**: More complex implementation
+
+**TorchTitan default**: 1F1B schedule (best memory/efficiency trade-off)
+
+### Microbatch Size Configuration
+
+```toml
+[parallelism]
+pipeline_parallel_degree = 4
+pipeline_parallel_microbatch_size = 1  # Microbatches per step
+```
+
+**Constraints**:
+```
+local_batch_size % pipeline_parallel_microbatch_size == 0
+num_microbatches = local_batch_size / pipeline_parallel_microbatch_size
+
+# For good efficiency:
+num_microbatches >= 4 * pipeline_parallel_degree
+```
+
+**Example**: With `local_batch_size=8` and `pp=4`:
+- `microbatch_size=1`: 8 microbatches → bubble ratio ≈ 27%
+- `microbatch_size=2`: 4 microbatches → bubble ratio ≈ 43%
+- `microbatch_size=4`: 2 microbatches → bubble ratio ≈ 60%
+
+Smaller microbatch size = better efficiency but more overhead.
+
+### PP + TP + FSDP: 3D Parallelism
+
+When combining PP with other parallelisms:
+
+```
+3D Parallelism (pp=2, tp=4, fsdp=8) on 64 GPUs:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Pipeline Stage 0                                   │
+│                           (Layers 0 to N/2)                                  │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                    TP Group (tp=4)                                   │   │
+│   │   ┌───────┬───────┬───────┬───────┐                                 │   │
+│   │   │ GPU 0 │ GPU 1 │ GPU 2 │ GPU 3 │  ← TP shards each layer        │   │
+│   │   └───────┴───────┴───────┴───────┘                                 │   │
+│   │            FSDP (8 groups total)                                     │   │
+│   │   Each TP group repeated 8× for FSDP                                │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                   │                                          │
+│                           activations                                        │
+│                                   ▼                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                           Pipeline Stage 1                                   │
+│                           (Layers N/2 to N)                                  │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                    TP Group (tp=4)                                   │   │
+│   │   ┌───────┬───────┬───────┬───────┐                                 │   │
+│   │   │GPU 32 │GPU 33 │GPU 34 │GPU 35 │  ← Different GPUs from stage 0 │   │
+│   │   └───────┴───────┴───────┴───────┘                                 │   │
+│   │            FSDP (8 groups total)                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+world_size = pp × tp × dp_shard = 2 × 4 × 8 = 64
+```
+
+**Communication pattern in 3D parallelism**:
+1. **Within each stage**: TP all-reduce (per layer) + FSDP all-gather/reduce-scatter
+2. **Between stages**: Send activations to next stage (during forward), send
+   gradients to previous stage (during backward)
+
+### When to Use Pipeline Parallelism
+
+**Use PP when**:
+- Model too large for FSDP + TP alone (200B+ parameters)
+- Want to scale beyond TP limits (TP max = 8 for 8 KV head models)
+- Training on very large clusters (100+ GPUs)
+
+**Don't use PP when**:
+- Model fits with FSDP + TP (PP adds complexity and bubbles)
+- Few GPUs available (bubbles dominate)
+- Latency-sensitive (pipeline adds latency)
+
+**PP efficiency considerations**:
+- Bubble overhead: 10-40% depending on microbatch count
+- Activation memory: Must store activations for all in-flight microbatches
+- Checkpoint complexity: Each stage saves separately
+
+### PP Configuration Example
+
+```toml
+# 405B model on 128 GPUs (16 nodes × 8 B200)
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 4       # FSDP within each TP×PP group
+tensor_parallel_degree = 8           # Max TP (limited by KV heads)
+pipeline_parallel_degree = 4         # 4 pipeline stages
+pipeline_parallel_microbatch_size = 1
+
+# world_size check: 1 × 4 × 8 × 4 = 128 ✓
+
+[training]
+local_batch_size = 4                 # 4 microbatches for reasonable efficiency
+```
+
+**Memory per GPU**:
+```
+405B params / (4 FSDP × 8 TP × 4 PP) = 405B / 128 ≈ 3.2B params effective
+3.2B × 16 bytes ≈ 50 GB for model/optimizer
++ activations (4 microbatches in flight)
+```
 
 ---
 
