@@ -26,6 +26,55 @@ Originated from a [request](https://github.com/pytorch/torchtitan/issues/790) to
 
 To register a `ModelConverter`, please follow the example of [Float8](../torchtitan/components/float8.py) to `register_model_converter`. Please make sure the registration code is called before training initialization. In torchtitan, it is performed during  [module import](../torchtitan/__init__.py).
 
+#### Why Model Converters Exist
+
+Model converters are a plugin system that transforms the model structure **before** parallelization is applied. They serve several critical use cases:
+
+1. **FP8 Training**: Replace `nn.Linear` with `Float8Linear` that performs 8-bit matrix multiplications
+2. **Fused Layers**: Replace standard attention with flash attention variants
+3. **Quantization-Aware Training (QAT)**: Modify layers to simulate quantization during training
+
+#### Why Converters Run Before Parallelization
+
+The timing is critical because:
+- Converters may add new parameters (e.g., FP8 scale tensors)
+- TP/FSDP parallelization relies on the final module structure
+- Once FSDP wraps modules, structure changes become complex
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Model Converter Timing                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   Model Definition    Model Converters      Parallelization         │
+│   (meta device)           apply            (TP, FSDP, PP)           │
+│        │                    │                    │                  │
+│        ▼                    ▼                    ▼                  │
+│   ┌─────────┐          ┌─────────┐          ┌─────────┐            │
+│   │ Create  │   ───►   │ Swap    │   ───►   │ Shard   │            │
+│   │ model   │          │ modules │          │ params  │            │
+│   │ on meta │          │ (FP8,   │          │ (FSDP), │            │
+│   │ device  │          │  QAT)   │          │ split   │            │
+│   └─────────┘          └─────────┘          │ tensors │            │
+│                                             │ (TP)    │            │
+│                                             └─────────┘            │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### The `post_optimizer_hook` Explained
+
+For FP8 training, after each optimizer step, we need to recompute dynamic scaling factors (`amax`) for all parameters. The hook allows batch computation across all parameters with a single all-reduce, which is more efficient than per-layer scaling:
+
+```python
+# During training initialization (train.py)
+model_converters = build_model_converters(job_config, parallel_dims)
+model_converters.convert(model)  # In-place modification BEFORE parallelization
+
+# ... later, after optimizer step (via registered hook):
+model_converters.post_optimizer_hook(model_parts)  # Batch amax computation
+```
+
 
 ### Train script
 

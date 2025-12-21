@@ -2,6 +2,85 @@
 
 You may want to enable checkpointing in `torchtitan` for better fault tolerance during training, or to enable easier importing and exporting of weights between `torchtitan` and other libraries. `torchtitan` offers varying degrees of support for other checkpoint formats which are listed further below.
 
+## Async Checkpointing
+
+Standard synchronous checkpointing blocks training while saving, which can take
+minutes for large models. TorchTitan offers three async modes to reduce this
+overhead.
+
+### The Three Modes
+
+| Mode | How it Works | Blocking Time | Memory Cost |
+|------|--------------|---------------|-------------|
+| `disabled` | Synchronous save | High (minutes for large models) | None |
+| `async` | Background threads via `dcp.async_save` | Low (tens of seconds) | GPU memory for staging |
+| `async_with_pinned_mem` | Separate process + pinned CPU memory | Near-zero (<1s) | High CPU memory |
+
+### Why `disabled` is the Default
+
+The conservative default ensures safety across all environments:
+
+1. **CPU Memory Safety**: The `async_with_pinned_mem` mode requires significant
+   CPU memory for pinned buffers that persist between checkpoints. From PyTorch
+   docs: pinned memory uses page-locked memory which "can be scarce as compared
+   to pageable memory."
+
+2. **GIL Contention**: Async modes use background threads that compete for
+   Python's Global Interpreter Lock (GIL), which can cause CPU stalls and
+   temporarily reduce training throughput during checkpoint writes.
+
+3. **Memory Multiplication**: Async checkpointing copies model state to CPU
+   buffers, effectively multiplying memory requirements by
+   `checkpoint_size_per_rank × number_of_ranks`.
+
+4. **Simplicity**: Synchronous checkpointing is predictable—training blocks
+   until save completes, making debugging easier.
+
+### When to Enable Each Mode
+
+```toml
+# For debugging/development (simplest, most predictable)
+[checkpoint]
+async_mode = "disabled"
+
+# For most production training (good balance of speed vs memory)
+[checkpoint]
+async_mode = "async"
+
+# For maximum throughput (requires ample CPU memory)
+[checkpoint]
+async_mode = "async_with_pinned_mem"
+```
+
+**Recommendation from TorchTitan source code**: "Use `async_with_pinned_mem` for
+production training (near-zero overhead)" — but only if you have sufficient CPU
+memory.
+
+### Performance Characteristics
+
+At scale (1856 GPUs training Llama3-70B), async checkpointing with cached plans
+reduced background processing time from ~436 seconds to ~67 seconds (6.5x
+improvement). For the Llama 3.1 8B model, TorchTitan achieves 5-15x reduction in
+checkpointing overhead compared to synchronous distributed checkpointing.
+
+### Considerations
+
+1. **FSDP CPU Offload Conflict**: If using `training.enable_cpu_offload=true`,
+   be cautious with `async_with_pinned_mem` as both compete for CPU memory.
+
+2. **Checkpoint Frequency**: If checkpointing every 1000+ steps, synchronous
+   save overhead may be negligible compared to total training time.
+
+3. **Large Models**: For very large models (70B+), async checkpointing becomes
+   more important as synchronous saves can take many minutes.
+
+4. **Pinned Memory Persistence**: With `async_with_pinned_mem`, the staging
+   buffer is maintained between checkpoints, causing sustained memory pressure
+   throughout training (unlike `async` mode where buffers are released after
+   each save).
+
+---
+
 ## A general guide to use checkpoints during training
 
 1. ENABLE CHECKPOINTING

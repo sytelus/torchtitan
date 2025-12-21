@@ -224,6 +224,38 @@ These map directly to `torch.utils.data.DataLoader` (used via
 StatefulDataLoader). `persistent_workers` and `prefetch_factor` require
 `num_workers > 0`.
 
+#### Why `pin_memory` is False by Default
+
+When `pin_memory=true`, PyTorch allocates data in "pinned" (page-locked) CPU
+memory, allowing faster CPU→GPU transfers via DMA (Direct Memory Access)
+without involving the CPU.
+
+The default is `false` because:
+
+1. **Memory Overhead**: Pinned memory is non-swappable and stays locked in RAM.
+   With large batch sizes or many workers, this can consume significant CPU
+   memory.
+
+2. **FSDP CPU Offloading Conflict**: When `enable_cpu_offload=true`, FSDP moves
+   parameters and optimizer states to CPU. If both the dataloader and FSDP
+   compete for pinned memory, you can run out of CPU RAM quickly.
+
+3. **Not Always Beneficial**: The benefit of pinned memory depends on how
+   CPU-bound your data loading is and whether data loading overlaps with GPU
+   compute. With `num_workers=0` (default), data loading is synchronous, and
+   pinned memory has limited benefit.
+
+**When to enable it**: Enable when you have sufficient CPU RAM and want to
+optimize CPU→GPU transfer for multi-worker dataloading:
+
+```toml
+[training.dataloader]
+num_workers = 4
+pin_memory = true
+persistent_workers = true
+prefetch_factor = 2
+```
+
 ---
 
 ## [parallelism]
@@ -378,6 +410,107 @@ StatefulDataLoader). `persistent_workers` and `prefetch_factor` require
 
 - `debug` (default: false)
   Enable debug info for checkpointing.
+
+### Understanding Activation Checkpointing Modes
+
+Activation checkpointing (AC), also known as gradient checkpointing, trades
+compute for memory. Instead of storing all intermediate activations during
+forward (for use in backward), AC discards them and recomputes during backward.
+
+**Memory vs Compute Tradeoff:**
+- Without AC: O(n_layers) activation memory, no extra compute
+- With AC: O(1) to O(sqrt(n_layers)) memory, ~10-33% more compute
+
+#### The Four Modes
+
+| Mode | Description | Memory Savings | Compute Overhead |
+|------|-------------|----------------|------------------|
+| `none` | No checkpointing | None | None |
+| `selective` | Checkpoint based on policy | Medium-High | Low-Medium |
+| `full` | Checkpoint every block | Maximum | ~33% |
+| `memory_budget` | Compiler-guided (requires torch.compile) | Configurable | Optimized |
+
+#### Selective Mode: Layer-Frequency vs Op-Level
+
+The `selective_ac_option` controls how selective checkpointing works:
+
+**Layer-Frequency (`"2"`, `"3"`, etc.):**
+```
+selective_ac_option = "2"  # Checkpoint every 2nd transformer block
+
+Layer 0: Save activations
+Layer 1: CHECKPOINT (discard, recompute in backward)
+Layer 2: Save activations
+Layer 3: CHECKPOINT (discard, recompute in backward)
+...
+```
+
+**Op-Level (`"op"`):**
+```
+selective_ac_option = "op"  # Fine-grained per-operation policy
+
+For each layer:
+  - matmul (mm): SAVE (expensive to recompute)
+  - attention (SDPA): SAVE (very expensive)
+  - reduce_scatter: SAVE (communication op)
+  - max: SAVE (for FP8 scaling)
+  - layer_norm: RECOMPUTE (cheap)
+  - activations: RECOMPUTE (cheap)
+  - dropout: RECOMPUTE (cheap)
+```
+
+#### Why Defaults Use `"2"` but Production Uses `"op"`
+
+| Setting | Default | Llama 8B Production |
+|---------|---------|---------------------|
+| `mode` | `"selective"` | `"selective"` |
+| `selective_ac_option` | `"2"` | `"op"` |
+
+**Default (`"2"`) rationale:**
+- Model-agnostic: works without model-specific op lists
+- Simpler and more predictable behavior
+- Good for debugging and quick experiments
+
+**Production (`"op"`) rationale:**
+- Better memory/compute tradeoff: only recomputes cheap ops
+- FP8 compatible: saves `max` ops for scaling factor computation
+- Distributed-safe: saves communication ops like `reduce_scatter`
+
+The op-level policy requires a model-specific `_op_sac_save_list` that defines
+which operations are expensive and should be saved. Each model in TorchTitan
+defines its own list in its `parallelize.py`.
+
+#### Recommendations
+
+**For production Llama/Qwen training:**
+```toml
+[activation_checkpoint]
+mode = "selective"
+selective_ac_option = "op"
+```
+
+**For debugging or quick experiments:**
+```toml
+[activation_checkpoint]
+mode = "selective"
+selective_ac_option = "2"
+```
+
+**For maximum memory savings (at compute cost):**
+```toml
+[activation_checkpoint]
+mode = "full"
+```
+
+**For compiler-optimized checkpointing (requires torch.compile):**
+```toml
+[activation_checkpoint]
+mode = "memory_budget"
+memory_budget = 0.5  # 0.0 = full AC, 1.0 = no AC
+
+[compile]
+enable = true
+```
 
 ---
 

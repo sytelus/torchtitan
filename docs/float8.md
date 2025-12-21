@@ -36,6 +36,111 @@ For parallelisms, for float8 with tensorwise scaling we support float8 all-gathe
 
 For scaling strategy, we currently support tensorwise dynamic scaling (stable) and rowwise dynamic scaling (alpha).
 
+---
+
+## Understanding Tensorwise vs Rowwise Scaling
+
+FP8 has a very limited dynamic range (~240 for E4M3 vs ~65504 for FP16). To
+prevent overflow/underflow, values must be scaled before FP8 conversion. The
+**scaling granularity** determines how many scale factors are used.
+
+### Scaling Granularities Comparison
+
+| Scaling Type | Granularity | Scale Factors | Accuracy | FP8 Communication |
+|--------------|-------------|---------------|----------|-------------------|
+| **Tensorwise** | 1 scale per entire tensor | 1 | Lower | Supported |
+| **Rowwise** | 1 scale per row/column | N (rows) | Higher | Not supported |
+| **Block-wise (MXFP8)** | 1 scale per 32 elements | N×M/32 | Highest | B200 only |
+
+### How Tensorwise Scaling Works
+
+```python
+# Tensorwise: ONE scale for entire tensor
+amax = tensor.abs().max()              # Single max across ALL elements
+scale = (FP8_MAX / amax)               # One scale factor
+fp8_tensor = (tensor * scale).to(float8_e4m3fn)
+
+# Rowwise: ONE scale per row (more accurate, but more scales to track)
+amax_per_row = tensor.abs().max(dim=1) # Max per row
+scale_per_row = (FP8_MAX / amax_per_row)
+fp8_tensor = (tensor * scale_per_row.unsqueeze(1)).to(float8_e4m3fn)
+```
+
+### Why Tensorwise Enables FP8 All-Gather
+
+The key advantage of tensorwise scaling for distributed training is that it
+enables **FP8 all-gather**, which halves communication volume:
+
+```
+Tensorwise Scaling with FSDP:
+┌────────────────────────────────────────────────────────────────────┐
+│                                                                    │
+│   Rank 0: weight_shard [FP8] ──┐                                  │
+│   Rank 1: weight_shard [FP8] ──┼──► All-Gather in FP8 (8 bits)   │
+│   Rank 2: weight_shard [FP8] ──┤    + 1 shared scale factor       │
+│   Rank 3: weight_shard [FP8] ──┘                                  │
+│                                                                    │
+│   Communication: N × 8 bits + 32 bits (scale) = ~50% savings      │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+Rowwise Scaling with FSDP:
+┌────────────────────────────────────────────────────────────────────┐
+│                                                                    │
+│   Rank 0: weight_shard [BF16] ──┐                                 │
+│   Rank 1: weight_shard [BF16] ──┼──► All-Gather in BF16 (16 bits)│
+│   Rank 2: weight_shard [BF16] ──┤    (can't use FP8 - scales vary)│
+│   Rank 3: weight_shard [BF16] ──┘                                 │
+│                                                                    │
+│   Communication: N × 16 bits (no savings)                         │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**Why rowwise can't use FP8 all-gather**: With rowwise scaling, each row has a
+different scale factor. After FSDP all-gather combines shards from different
+ranks, the rows would have incompatible scales - you can't combine them without
+first converting back to high precision.
+
+### Configuration
+
+```toml
+# Tensorwise scaling (default) - enables FP8 all-gather
+[quantize.linear.float8]
+enable_fsdp_float8_all_gather = true              # FP8 communication (50% savings)
+precompute_float8_dynamic_scale_for_fsdp = true   # Efficient amax all-reduce
+# recipe_name not set = tensorwise by default
+
+# Rowwise scaling - higher accuracy, no FP8 all-gather benefit
+[quantize.linear.float8]
+recipe_name = "rowwise"
+# enable_fsdp_float8_all_gather is ignored - always uses high-precision comm
+```
+
+### Trade-offs Summary
+
+| Aspect | Tensorwise | Rowwise |
+|--------|------------|---------|
+| **Accuracy** | Lower (1 scale for all values) | Higher (1 scale per row) |
+| **FSDP Communication** | FP8 (half bandwidth) | BF16 (full bandwidth) |
+| **TP Communication** | FP8 all-gather supported | High-precision only |
+| **Best for** | Large models, bandwidth-bound | Accuracy-critical training |
+| **Stability** | Stable | Alpha |
+
+### When to Use Each
+
+**Use tensorwise (default) when:**
+- Training large models where communication is a bottleneck
+- Memory bandwidth is limiting factor
+- Willing to trade some accuracy for speed
+
+**Use rowwise when:**
+- Training smaller models where accuracy matters more
+- Not bandwidth-bound (small world size, fast interconnect)
+- Experiencing convergence issues with tensorwise
+
+---
+
 ## Benefits of composing of float8 with tensorwise scaling with `torch.distributed`
 **Float8 vs Bfloat16/Float32**: In float8 E4M3 format, we only have 3 bits for mantissa, it becomes user's responsibility to maintain consistent scales across operations (summation, multiplication) to balance between precision and range. For bfloat16/float32, exponent range is large enough and users do not need to maintain such scales. When using float8 in FSDP and TP, tensors are sharded across ranks. To keep single device semantics, it's critical to communicate scales across ranks.
 
