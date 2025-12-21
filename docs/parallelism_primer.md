@@ -1187,6 +1187,430 @@ efficiency. Going below 2K increases communication overhead.
 
 ---
 
+## Parallelism Selection Guide for Llama3-like Models on B200 GPUs
+
+This section provides practical guidance on selecting parallelism strategies
+based on model size for Llama3-like transformer architectures. All calculations
+assume NVIDIA B200 GPUs (192 GB HBM3e) with 8 GPUs per node, 8K context length,
+and BF16 mixed precision training.
+
+### Memory Requirements for Training
+
+Training a model requires memory for multiple components:
+
+```
+Total Training Memory = Parameters + Gradients + Optimizer States + Activations
+
+Components (BF16 mixed precision with AdamW):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Component          │ Bytes per Parameter │ Notes                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ Parameters (BF16)  │ 2 bytes             │ Model weights                   │
+│ Gradients (BF16)   │ 2 bytes             │ Same size as params             │
+│ Optimizer States   │ 8 bytes             │ Adam momentum + variance (FP32) │
+│ Master Weights     │ 4 bytes             │ FP32 copy for optimizer update  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TOTAL              │ 16 bytes/param      │ ~16 GB per billion parameters   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Memory formula**:
+```
+Model/Optimizer Memory ≈ num_params × 16 bytes
+```
+
+### Activation Memory
+
+Activations scale with batch size, sequence length, and model dimensions:
+
+```
+Per-layer activation memory (approximate, with FlashAttention):
+
+Activations ≈ batch × seq_len × hidden_dim × bytes_per_element × factor
+
+Where factor accounts for:
+- Input/output of each sublayer (attention, FFN)
+- Intermediate FFN activations (typically 4× hidden_dim)
+- Normalization layers
+- Residual connections
+
+Typical factor: 10-20× for full activations, 2-4× with selective checkpointing
+```
+
+**Activation estimates for 8K context, batch=1, BF16**:
+
+| Model Size | Hidden Dim | Layers | Activations (full) | Activations (selective AC) |
+|------------|------------|--------|-------------------|---------------------------|
+| 8B | 4096 | 32 | ~40 GB | ~10 GB |
+| 70B | 8192 | 80 | ~200 GB | ~50 GB |
+| 405B | 16384 | 126 | ~600 GB | ~150 GB |
+
+### Llama3 Model Specifications
+
+Reference architecture parameters:
+
+| Model | Parameters | Hidden Dim | Layers | Heads | KV Heads | FFN Dim |
+|-------|------------|------------|--------|-------|----------|---------|
+| 8B | 8B | 4096 | 32 | 32 | 8 | ~14K |
+| 70B | 70B | 8192 | 80 | 64 | 8 | ~28K |
+| 405B | 405B | 16384 | 126 | 128 | 8 | ~53K |
+
+### Calculation: When Each Parallelism is Needed
+
+#### Single GPU (No Parallelism)
+
+**Capacity**: 192 GB B200
+
+**Maximum model size**:
+```
+192 GB available
+─ ~20 GB reserved (CUDA, framework overhead)
+= ~170 GB usable
+
+170 GB ÷ 16 bytes/param = ~10.6B parameters (model + optimizer)
+Minus activations (~10 GB with AC) = ~10B parameters max
+```
+
+**Conclusion**: Models up to ~8-10B can fit on a single B200 with activation
+checkpointing. In practice, use FSDP even for 8B for memory headroom.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Single GPU: Models ≤ 8B (tight), practical limit ~5-6B for comfortable fit │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### FSDP on Single Node (8 GPUs)
+
+**Capacity**: 8 × 192 GB = 1.5 TB (shared via FSDP)
+
+With FSDP, each GPU holds 1/8 of parameters and optimizer states, but needs
+memory for:
+- Full gradients during backward (temporarily)
+- Local activations
+
+**Effective capacity per GPU**:
+```
+Parameters + Optimizer: (P × 16) ÷ 8 = 2 bytes/param per GPU
+Gradients (temporary): P × 2 bytes (full, during backward)
+Activations: ~10-50 GB depending on model size and AC
+
+Example for 70B model:
+- Params + Optimizer: 70B × 2 = 140 GB distributed across 8 GPUs = 17.5 GB/GPU
+- Gradients: 70B × 2 = 140 GB (temporary, during backward)
+- Activations: ~50 GB with selective AC
+
+Total per GPU: 17.5 + 140/8 + 50 ≈ 85 GB — fits in 192 GB!
+Wait, gradients are also sharded in FSDP2 reduce-scatter...
+
+Corrected with FSDP2:
+- Sharded params + opt: 17.5 GB
+- Sharded gradients: 17.5 GB
+- Activations: ~50 GB
+- Temporary all-gathered params: ~17.5 GB (during forward/backward)
+Total: ~100 GB — fits comfortably!
+```
+
+**Maximum model size with 8-way FSDP**:
+```
+Usable per GPU: ~170 GB
+With activations (~50 GB): ~120 GB for model/optimizer shards
+
+Each GPU needs: (P × 16) ÷ 8 + temporary overhead ≈ (P × 4) per GPU
+120 GB = P × 4 bytes → P ≈ 30B effective
+But with activation scaling, practical limit is ~70B
+```
+
+**Conclusion**: 8-way FSDP on single node handles models up to ~70B.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ FSDP (8 GPUs): Models 8B-70B                                                │
+│ - 8B: Comfortable, can increase batch size                                  │
+│ - 40B: Good fit, moderate batch size                                        │
+│ - 70B: Tight fit, batch=1-2, requires selective AC                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### HSDP (Multi-Node FSDP + DDP)
+
+When to use HSDP instead of pure FSDP across nodes:
+
+**Benefits of HSDP over cross-node FSDP**:
+1. FSDP communication (all-gather, reduce-scatter) stays on fast NVLink
+2. Only gradient averaging (DDP) goes over slower inter-node network
+3. Better throughput for models that fit in single-node FSDP
+
+**Configuration**:
+```toml
+[parallelism]
+data_parallel_replicate_degree = N  # Number of nodes (DDP across nodes)
+data_parallel_shard_degree = 8      # FSDP within each node
+```
+
+**When HSDP helps**:
+- Model fits in 8-way FSDP (≤70B)
+- Training on 2+ nodes
+- Want maximum throughput with data parallelism
+
+**When to use pure FSDP across nodes instead**:
+- Model too large for single-node FSDP (>70B)
+- Memory per GPU is the bottleneck
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ HSDP: Models 8B-70B on 2+ nodes                                             │
+│ - Combines throughput scaling (DDP) with memory efficiency (FSDP)          │
+│ - Best for models that fit in single-node FSDP                             │
+│                                                                             │
+│ Example configs:                                                            │
+│ - 8B on 4 nodes:  dp_replicate=4, dp_shard=8 (32 GPUs)                     │
+│ - 70B on 4 nodes: dp_replicate=4, dp_shard=8 (32 GPUs, batch=1-2)          │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### When Tensor Parallelism (TP) is Required
+
+TP becomes necessary when:
+
+1. **Single layer exceeds GPU memory** (even with FSDP)
+2. **Activation memory per GPU is too high**
+3. **Improving compute efficiency for very large layers**
+
+**Layer size analysis**:
+
+For a transformer layer, the largest components are:
+```
+Attention weights: 4 × dim × dim (wq, wk, wv, wo simplified)
+FFN weights: 3 × dim × ffn_dim
+
+Llama3 70B (dim=8192, ffn_dim≈28K):
+- Attention: 4 × 8192 × 8192 = 268M params = 536 MB (BF16)
+- FFN: 3 × 8192 × 28K = 688M params = 1.4 GB (BF16)
+- Per layer: ~2 GB in BF16
+
+Llama3 405B (dim=16384, ffn_dim≈53K):
+- Attention: 4 × 16384 × 16384 = 1.07B params = 2.1 GB (BF16)
+- FFN: 3 × 16384 × 53K = 2.6B params = 5.2 GB (BF16)
+- Per layer: ~7.3 GB in BF16
+```
+
+With FSDP, layers are sharded, so individual layer size rarely causes OOM.
+But **activation memory** for large models benefits significantly from TP:
+
+```
+Activation memory reduction with TP:
+
+Without TP: Each GPU stores full [batch, seq, hidden] activations
+With TP=8: Each GPU stores [batch, seq, hidden/8] for some tensors
+
+For 405B (hidden=16384), seq=8K, batch=1:
+- Full activation tensor: 1 × 8K × 16K × 2 = 256 MB per tensor
+- With TP=8: 1 × 8K × 2K × 2 = 32 MB per tensor
+
+Per-layer savings add up across 126 layers!
+```
+
+**When to enable TP**:
+
+| Model Size | Hidden Dim | TP Recommendation | Reason |
+|------------|------------|-------------------|--------|
+| ≤8B | ≤4096 | TP=1 (disabled) | FSDP sufficient |
+| 8B-40B | 4096-6144 | TP=1 or TP=2 | Optional for activation savings |
+| 70B | 8192 | TP=2 or TP=4 | Reduces activation memory |
+| 200B+ | 12288+ | TP=4 or TP=8 | Required for activation memory |
+| 405B | 16384 | TP=8 | Required for practical training |
+
+**TP constraints reminder**: `n_kv_heads % tp == 0` (Llama3 has 8 KV heads,
+so TP must be 1, 2, 4, or 8)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Tensor Parallelism Guidelines:                                              │
+│                                                                             │
+│ - ≤70B: TP optional, use TP=2-4 if activation memory is tight              │
+│ - 70B-200B: TP=4 recommended                                                │
+│ - 200B+: TP=8 required                                                      │
+│                                                                             │
+│ Rule of thumb: Enable TP when hidden_dim > 8192 or params > 70B            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### When Pipeline Parallelism (PP) is Required
+
+PP is the last resort when FSDP + TP isn't sufficient:
+
+**PP memory calculation**:
+```
+With PP, each GPU holds only (n_layers ÷ pp_degree) layers.
+
+Example: 405B with PP=4
+- 126 layers ÷ 4 = ~31 layers per stage
+- Each stage: 405B ÷ 4 ≈ 100B parameters
+- Memory per stage: 100B × 16 bytes = 1.6 TB
+
+Still need FSDP to shard each stage!
+
+With PP=4, TP=8, FSDP=8 on 256 GPUs (32 nodes):
+- PP splits into 4 stages
+- Each stage: TP=8 for layers, FSDP=8 for sharding
+- Per GPU: 405B ÷ (4 × 8 × 8) = ~1.6B params effective
+- Memory: ~25 GB for model/optimizer — very comfortable!
+```
+
+**When PP is needed**:
+1. Model doesn't fit even with FSDP + TP across available GPUs
+2. Want to scale beyond TP limits (TP=8 max for Llama3)
+3. Training 200B+ models efficiently
+
+**PP considerations**:
+- Adds pipeline bubbles (reduced efficiency)
+- Requires careful microbatch sizing
+- More complex checkpoint/resume
+
+| Model Size | Minimum Configuration | Recommended Configuration |
+|------------|----------------------|--------------------------|
+| 405B | PP=2, TP=8, FSDP≥8 | PP=4, TP=8, FSDP=8 |
+| 1T+ | PP=4+, TP=8, FSDP≥8 | PP=8+, TP=8, FSDP=8 |
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Pipeline Parallelism Guidelines:                                            │
+│                                                                             │
+│ - ≤200B: Usually not needed (FSDP + TP sufficient)                         │
+│ - 200B-500B: PP=2-4 may help with memory or scaling                        │
+│ - 500B+: PP required (PP=4-8)                                              │
+│                                                                             │
+│ Rule of thumb: Use PP when FSDP + TP can't fit the model                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Complete Decision Flowchart
+
+```
+                    ┌─────────────────────────┐
+                    │   Model Size (params)   │
+                    └───────────┬─────────────┘
+                                │
+            ┌───────────────────┼───────────────────┐
+            │                   │                   │
+            ▼                   ▼                   ▼
+       ┌─────────┐         ┌─────────┐         ┌─────────┐
+       │  ≤10B   │         │ 10B-70B │         │  >70B   │
+       └────┬────┘         └────┬────┘         └────┬────┘
+            │                   │                   │
+            ▼                   ▼                   ▼
+    ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+    │ Single GPU or │   │    FSDP or    │   │  FSDP + TP    │
+    │  FSDP (8 GPU) │   │     HSDP      │   │   required    │
+    └───────┬───────┘   └───────┬───────┘   └───────┬───────┘
+            │                   │                   │
+            ▼                   ▼                   ▼
+    ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+    │ Multi-node?   │   │ Multi-node?   │   │    >200B?     │
+    │   Use HSDP    │   │   Use HSDP    │   │   Add PP      │
+    └───────────────┘   └───────────────┘   └───────────────┘
+```
+
+### Recommended Configurations by Model Size
+
+**B200 Cluster (8 GPUs/node, 192 GB/GPU, 8K context)**:
+
+| Model | Nodes | GPUs | dp_replicate | dp_shard | TP | PP | Notes |
+|-------|-------|------|--------------|----------|----|----|-------|
+| 8B | 1 | 8 | 1 | 8 | 1 | 1 | Pure FSDP, batch=8-16 |
+| 8B | 4 | 32 | 4 | 8 | 1 | 1 | HSDP for throughput |
+| 40B | 1 | 8 | 1 | 8 | 1 | 1 | FSDP, batch=2-4 |
+| 40B | 4 | 32 | 4 | 8 | 1 | 1 | HSDP, batch=2-4 |
+| 70B | 1 | 8 | 1 | 8 | 2 | 1 | FSDP+TP, batch=1-2 |
+| 70B | 4 | 32 | 4 | 4 | 2 | 1 | HSDP+TP, batch=1-2 |
+| 70B | 8 | 64 | 2 | 4 | 8 | 1 | High TP for memory |
+| 200B | 8 | 64 | 1 | 8 | 8 | 1 | FSDP+TP, batch=1 |
+| 405B | 16 | 128 | 1 | 4 | 8 | 4 | Full 3D parallelism |
+| 405B | 32 | 256 | 2 | 4 | 8 | 4 | HSDP+TP+PP |
+
+**Configuration formulas**:
+```
+world_size = dp_replicate × dp_shard × tp × pp
+nodes = world_size ÷ 8
+
+Memory per GPU ≈ (params × 16) ÷ (dp_shard × tp × pp) + activations
+```
+
+### Example Calculation: 70B on 4 Nodes
+
+**Setup**: 70B Llama3, 4 nodes × 8 B200 GPUs = 32 GPUs
+
+**Option 1: Pure HSDP (dp_replicate=4, dp_shard=8)**
+```
+Model memory: 70B × 16 bytes = 1.12 TB
+Sharded across 8 GPUs: 1.12 TB ÷ 8 = 140 GB/GPU
+Activations (8K context, selective AC): ~50 GB
+Total: ~190 GB — just barely fits 192 GB!
+
+Problem: No headroom for batch size > 1
+```
+
+**Option 2: HSDP + TP (dp_replicate=4, dp_shard=4, tp=2)**
+```
+Effective sharding: dp_shard × tp = 4 × 2 = 8-way
+Model memory per GPU: 1.12 TB ÷ 8 = 140 GB
+Activations with TP=2: ~35 GB (reduced by TP)
+Total: ~175 GB — fits with headroom!
+
+Benefits: Can use batch=2, better activation memory
+```
+
+**Option 3: More TP (dp_replicate=2, dp_shard=2, tp=8)**
+```
+Effective sharding: dp_shard × tp = 2 × 8 = 16-way
+Model memory per GPU: 1.12 TB ÷ 16 = 70 GB
+Activations with TP=8: ~15 GB
+Total: ~85 GB — very comfortable!
+
+Trade-off: Less data parallelism (only 4 replicas)
+```
+
+**Recommendation for 70B on 32 GPUs**: Option 2 (HSDP + TP=2) balances
+memory efficiency with training throughput.
+
+### Summary: Parallelism Thresholds for B200 (192 GB)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Parallelism Selection Summary                           │
+│                   (B200 GPUs, 8K context, BF16 training)                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Model Size        Parallelism Stack           Key Constraint              │
+│  ───────────       ──────────────────          ──────────────              │
+│                                                                             │
+│  ≤8B               FSDP (single node)          Memory comfortable          │
+│                    or HSDP (multi-node)                                     │
+│                                                                             │
+│  8B-40B            FSDP or HSDP                 Good batch sizes           │
+│                                                                             │
+│  40B-70B           FSDP/HSDP + TP=2            Activation memory           │
+│                                                                             │
+│  70B-200B          FSDP + TP=4-8               TP required for activations │
+│                                                                             │
+│  200B-500B         FSDP + TP=8 (+ PP=2-4)      May need PP for model fit   │
+│                                                                             │
+│  >500B             FSDP + TP=8 + PP=4-8        Full 3D parallelism         │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Quick Reference:                                                           │
+│  • FSDP alone: ≤70B (single node), ≤40B comfortable                        │
+│  • Add TP: When hidden_dim > 8K or activations tight                       │
+│  • Add PP: When model > 200B or FSDP+TP can't fit                          │
+│  • HSDP over FSDP: When model fits in single-node FSDP                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Single GPU and Debug Configurations
 
 ### Running Without Any Parallelism
