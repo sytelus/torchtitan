@@ -1,0 +1,78 @@
+# Qwen3 1.7B HSDP Training on ClimbMix Dataset
+# Optimized for 4 nodes × 8 B200 GPUs (32 GPUs total)
+# BF16 mixed precision training with HSDP parallelism
+#
+# For a full option list and defaults, see docs/config_reference.md.
+# For parallelism concepts, see docs/parallelism_primer.md.
+
+[job]
+dump_folder = "./outputs/qwen3_1.7b_climbmix"
+description = "Qwen3 1.7B pretraining on ClimbMix with HSDP (4 nodes × 8 B200 GPUs)"
+
+[profiling]
+enable_profiling = true
+save_traces_folder = "profile_trace"
+profile_freq = 500
+
+[metrics]
+log_freq = 10
+enable_tensorboard = false
+enable_wandb = true
+save_tb_folder = "tb"
+
+[model]
+name = "qwen3"
+flavor = "1.7B"
+hf_assets_path = "./assets/hf/Qwen3-1.7B"
+
+[optimizer]
+name = "AdamW"
+lr = 3e-4
+eps = 1e-8
+fused = true  # Use fused AdamW for better performance
+
+[lr_scheduler]
+warmup_steps = 2000  # ~1% of total steps for large-scale training
+decay_ratio = 0.1    # 10% final LR
+decay_type = "cosine"
+
+[training]
+local_batch_size = 8          # Per-GPU batch size
+seq_len = 4096                # Qwen3 default context length
+max_norm = 1.0                # Gradient clipping
+steps = 200000                # ~400B tokens with global batch 1M tokens/step
+dataset = "climbmix"
+mixed_precision = "bfloat16"  # BF16 mixed precision for B200
+
+[parallelism]
+# HSDP: FSDP within nodes (8 GPUs), DDP across nodes (4 nodes)
+# This maximizes intra-node bandwidth for FSDP and uses inter-node for DDP
+data_parallel_replicate_degree = 4    # Replicate across 4 nodes
+data_parallel_shard_degree = 8        # Shard within each node's 8 GPUs
+fsdp_reshard_after_forward = "default"
+tensor_parallel_degree = 1
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[checkpoint]
+enable = true
+folder = "checkpoint"
+interval = 5000
+last_save_model_only = false
+export_dtype = "bfloat16"
+async_mode = "async"  # Async checkpointing for minimal training interruption
+last_save_in_hf = true  # Export final checkpoint in HuggingFace format
+
+[activation_checkpoint]
+mode = "selective"  # Balance between memory and compute
+selective_ac_option = "op"
+
+[compile]
+enable = true  # Enable torch.compile for performance
+components = ["model", "loss"]
+
+[quantize.linear.float8]
+# FP8 disabled for BF16 training (enable for H100/B200 with FP8 support)
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false
+filter_fqns = ["output"]

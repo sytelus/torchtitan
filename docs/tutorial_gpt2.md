@@ -1,12 +1,15 @@
-# TorchTitan Tutorial: Training GPT-2 from Scratch
+# TorchTitan Tutorial: Training LLMs from Scratch
 
-This tutorial walks you through using TorchTitan to train a GPT-2 language model,
-starting from a single GPU and scaling to multi-GPU training. You'll learn:
+This tutorial walks you through using TorchTitan to train language models,
+starting from a single GPU with GPT-2 and scaling to multi-node training with
+Qwen3. You'll learn:
 
 1. How to install TorchTitan on a workstation with a single NVIDIA A100 GPU
 2. How to add a new GPT-2 model to TorchTitan
 3. How to train on Shakespeare data with WandB metrics visualization
 4. How to scale to 8 B200 GPUs using DDP (Distributed Data Parallel)
+5. How to evaluate trained models using lm_eval benchmarks
+6. How to pretrain Qwen3 1.7B on 4 nodes (32 GPUs) with HSDP and ClimbMix dataset
 
 ---
 
@@ -773,9 +776,445 @@ your checkpoint conversion worked correctly.
 
 ---
 
-## Part 9: Next Steps
+## Part 9: Multi-Node Pretraining with Qwen3 1.7B
 
-Now that you've trained and evaluated GPT-2 with TorchTitan, explore:
+This section walks through pretraining Qwen3 1.7B from scratch on 4 nodes of 8
+B200 GPUs each (32 GPUs total) using HSDP (Hybrid Sharded Data Parallel) and
+the ClimbMix dataset.
+
+### 9.1 Prerequisites
+
+#### Hardware Requirements
+
+- 4 nodes with 8 NVIDIA B200 GPUs each (32 GPUs total)
+- High-bandwidth inter-node networking (InfiniBand or AWS EFA recommended)
+- At least 2TB shared storage for checkpoints
+
+#### Software Requirements
+
+- PyTorch nightly with CUDA 12.8 (for B200 support)
+- TorchTitan installed on all nodes
+- Slurm or similar job scheduler (optional but recommended)
+
+### 9.2 Environment Setup
+
+#### Docker Setup (Recommended)
+
+For multi-node training, using Docker ensures consistent environments:
+
+```bash
+# Pull the PyTorch nightly container
+docker pull nvcr.io/nvidia/pytorch:24.12-py3
+
+# Or build a custom container
+cat > Dockerfile << 'EOF'
+FROM nvcr.io/nvidia/pytorch:24.12-py3
+
+# Install TorchTitan
+WORKDIR /workspace
+RUN git clone https://github.com/pytorch/torchtitan.git
+WORKDIR /workspace/torchtitan
+RUN pip install -e .
+
+# Install additional dependencies
+RUN pip install wandb datasets
+EOF
+
+docker build -t torchtitan:latest .
+```
+
+#### Native Installation (All Nodes)
+
+If not using Docker, install on each node:
+
+```bash
+# On each node
+git clone https://github.com/pytorch/torchtitan.git
+cd torchtitan
+
+# Install PyTorch nightly for B200/Blackwell
+pip3 install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128 --force-reinstall
+
+# Install TorchTitan
+pip install -e .
+
+# Verify installation
+python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}')"
+```
+
+### 9.3 Download Qwen3 Tokenizer
+
+The model weights are trained from scratch, but we need the tokenizer:
+
+```bash
+# Download Qwen3 tokenizer (not the full model)
+python scripts/download_hf_assets.py \
+    --repo_id Qwen/Qwen3-1.7B \
+    --assets tokenizer \
+    --local_dir ./assets/hf/Qwen3-1.7B
+```
+
+This downloads:
+- `tokenizer.json` - The tokenizer definition
+- `tokenizer_config.json` - BOS/EOS token configuration
+- `vocab.json` and `merges.txt` - BPE vocabulary files
+
+### 9.4 WandB Setup
+
+Configure Weights & Biases for metrics visualization:
+
+```bash
+# On the head node (or all nodes if using Slurm)
+pip install wandb
+wandb login
+
+# Set project and entity (optional)
+export WANDB_PROJECT="qwen3-pretraining"
+export WANDB_ENTITY="your-team-name"
+```
+
+### 9.5 Understanding HSDP Configuration
+
+HSDP (Hybrid Sharded Data Parallel) combines the best of FSDP and DDP:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    HSDP Architecture                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Node 0 (FSDP Group 0)    Node 1 (FSDP Group 1)              │
+│  ┌─────────────────┐      ┌─────────────────┐               │
+│  │ GPU0 GPU1 GPU2  │      │ GPU0 GPU1 GPU2  │               │
+│  │ GPU3 GPU4 GPU5  │ DDP  │ GPU3 GPU4 GPU5  │               │
+│  │ GPU6 GPU7       │◄────►│ GPU6 GPU7       │               │
+│  │                 │      │                 │               │
+│  │ Sharded Params  │      │ Sharded Params  │               │
+│  │ (high BW NVLink)│      │ (high BW NVLink)│               │
+│  └─────────────────┘      └─────────────────┘               │
+│           ▲                        ▲                         │
+│           │      DDP Gradient      │                         │
+│           │      Sync (EFA/IB)     │                         │
+│           ▼                        ▼                         │
+│  Node 2 (FSDP Group 2)    Node 3 (FSDP Group 3)              │
+│  ┌─────────────────┐      ┌─────────────────┐               │
+│  │ GPU0-7 Sharded  │ DDP  │ GPU0-7 Sharded  │               │
+│  │                 │◄────►│                 │               │
+│  └─────────────────┘      └─────────────────┘               │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+
+Configuration for 32 GPUs (4 nodes × 8 GPUs):
+- data_parallel_shard_degree = 8   (FSDP within each node)
+- data_parallel_replicate_degree = 4 (DDP across 4 nodes)
+```
+
+**Why HSDP?**
+- FSDP within nodes uses high-bandwidth NVLink (900 GB/s on B200)
+- DDP across nodes uses lower-bandwidth network (400 Gb/s EFA/IB)
+- This topology matches the hardware hierarchy for optimal performance
+
+### 9.6 Training Configuration
+
+The optimized configuration file is at:
+`torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix.toml`
+
+Key settings:
+
+```toml
+[model]
+name = "qwen3"
+flavor = "1.7B"
+hf_assets_path = "./assets/hf/Qwen3-1.7B"
+
+[training]
+local_batch_size = 8          # 8 samples × 4096 tokens × 32 GPUs = 1M tokens/step
+seq_len = 4096
+steps = 200000                # ~200B tokens total
+dataset = "climbmix"
+mixed_precision = "bfloat16"
+
+[parallelism]
+data_parallel_replicate_degree = 4    # DDP across 4 nodes
+data_parallel_shard_degree = 8        # FSDP within 8 GPUs/node
+
+[metrics]
+enable_wandb = true           # Enable WandB logging
+log_freq = 10                 # Log every 10 steps
+
+[checkpoint]
+enable = true
+interval = 5000
+async_mode = "async"          # Non-blocking checkpoints
+last_save_in_hf = true        # Export final checkpoint to HuggingFace format
+
+[compile]
+enable = true                 # torch.compile for performance
+```
+
+### 9.7 Launch Multi-Node Training
+
+#### Option A: Using Slurm
+
+Create or modify `multinode_trainer.slurm`:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=qwen3_1.7b_pretrain
+#SBATCH --nodes=4
+#SBATCH --ntasks=4
+#SBATCH --gpus-per-task=8
+#SBATCH --cpus-per-task=96
+#SBATCH --partition=gpu
+#SBATCH --time=72:00:00
+#SBATCH --output=logs/qwen3_%j.log
+
+# Get head node IP
+nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
+head_node=${nodes[0]}
+head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
+
+echo "Head node: $head_node ($head_node_ip)"
+
+# NCCL settings for optimal performance
+export NCCL_DEBUG=WARN
+export NCCL_SOCKET_IFNAME="eth0,en,eth,em,bond"
+export NCCL_BUFFSIZE=2097152
+
+# For AWS with EFA
+export FI_PROVIDER="efa"
+export FI_EFA_SET_CUDA_SYNC_MEMOPS=0
+export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+
+# WandB settings
+export WANDB_PROJECT="qwen3-pretraining"
+
+# Memory settings
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
+
+# Launch training
+CONFIG_FILE="./torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix.toml"
+
+srun torchrun \
+    --nnodes 4 \
+    --nproc_per_node 8 \
+    --rdzv_id $SLURM_JOB_ID \
+    --rdzv_backend c10d \
+    --rdzv_endpoint "$head_node_ip:29500" \
+    -m torchtitan.train \
+    --job.config_file ${CONFIG_FILE}
+```
+
+Submit the job:
+
+```bash
+sbatch multinode_trainer.slurm
+```
+
+#### Option B: Manual Launch (Without Slurm)
+
+On the head node (Node 0):
+
+```bash
+# Set environment variables
+export MASTER_ADDR=$(hostname -i)
+export MASTER_PORT=29500
+export WORLD_SIZE=32
+export NCCL_DEBUG=WARN
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
+
+# On Node 0
+torchrun \
+    --nnodes 4 \
+    --nproc_per_node 8 \
+    --node_rank 0 \
+    --master_addr $MASTER_ADDR \
+    --master_port $MASTER_PORT \
+    -m torchtitan.train \
+    --job.config_file ./torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix.toml
+```
+
+On other nodes (run simultaneously):
+
+```bash
+# On Node 1
+export MASTER_ADDR=<head_node_ip>
+torchrun --nnodes 4 --nproc_per_node 8 --node_rank 1 \
+    --master_addr $MASTER_ADDR --master_port 29500 \
+    -m torchtitan.train \
+    --job.config_file ./torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix.toml
+
+# On Node 2
+torchrun --nnodes 4 --nproc_per_node 8 --node_rank 2 ...
+
+# On Node 3
+torchrun --nnodes 4 --nproc_per_node 8 --node_rank 3 ...
+```
+
+### 9.8 Monitoring Training Metrics
+
+#### WandB Dashboard
+
+Once training starts, view metrics at https://wandb.ai:
+
+| Metric | Description |
+|--------|-------------|
+| `loss` | Training loss (should decrease) |
+| `learning_rate` | Current LR (warmup → peak → decay) |
+| `tokens_per_second` | Training throughput |
+| `tokens_per_second_per_gpu` | Per-GPU efficiency |
+| `mfu` | Model FLOPS Utilization (% of peak) |
+| `memory/max_active_pct` | GPU memory usage |
+
+#### Expected Metrics for Qwen3 1.7B on 32 B200 GPUs
+
+| Metric | Expected Value |
+|--------|----------------|
+| Tokens per second | ~1.5-2M tokens/s |
+| Tokens per GPU per second | ~50K tokens/s |
+| MFU | 40-50% |
+| Memory usage | ~60-70% of 192GB |
+| Time to 200K steps | ~3-4 days |
+
+#### Terminal Logging
+
+TorchTitan logs metrics to the terminal:
+
+```
+[rank0] Step 100 | Loss: 8.42 | LR: 3.00e-05 | Tokens/s: 1,523,456 | MFU: 45.2%
+[rank0] Step 200 | Loss: 7.15 | LR: 6.00e-05 | Tokens/s: 1,612,892 | MFU: 47.1%
+...
+```
+
+### 9.9 Performance Tuning
+
+#### Tune Batch Size
+
+If you have memory headroom, increase batch size:
+
+```bash
+# Try larger batch size
+--training.local_batch_size 16
+```
+
+#### Enable FP8 (H100/B200)
+
+For additional speedup on Hopper/Blackwell GPUs:
+
+```toml
+[model]
+converters = ["float8"]
+
+[quantize.linear.float8]
+enable_fsdp_float8_all_gather = true
+precompute_float8_dynamic_scale_for_fsdp = true
+```
+
+#### Activation Checkpointing
+
+If OOM, use full activation checkpointing:
+
+```bash
+--activation_checkpoint.mode full
+```
+
+#### Disable Compilation (Debugging)
+
+If you see compilation issues:
+
+```bash
+--compile.enable=false
+```
+
+### 9.10 Checkpointing and Recovery
+
+#### Checkpoint Structure
+
+Checkpoints are saved to `./outputs/qwen3_1.7b_climbmix/checkpoint/step-XXXXX/`:
+
+```
+step-5000/
+├── __0_0.distcp           # Distributed checkpoint shards
+├── __1_0.distcp
+├── ...
+├── .metadata              # Checkpoint metadata
+└── train_state.json       # Training state (step, optimizer)
+```
+
+#### Resume from Checkpoint
+
+To resume training:
+
+```bash
+torchrun ... -m torchtitan.train \
+    --job.config_file ./torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix.toml \
+    --checkpoint.resume
+```
+
+#### Export to HuggingFace
+
+The final checkpoint is auto-exported to HuggingFace format. To manually convert:
+
+```bash
+python scripts/checkpoint_conversion/convert_to_hf.py \
+    --model qwen3 \
+    --flavor 1.7B \
+    --checkpoint_path ./outputs/qwen3_1.7b_climbmix/checkpoint/step-200000 \
+    --output_path ./outputs/qwen3_1.7b_hf
+```
+
+### 9.11 Troubleshooting
+
+#### NCCL Timeout
+
+```bash
+# Increase timeout
+export NCCL_TIMEOUT=1800
+
+# Debug NCCL issues
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,GRAPH,ENV
+```
+
+#### OOM Errors
+
+```bash
+# Reduce batch size
+--training.local_batch_size 4
+
+# Enable full activation checkpointing
+--activation_checkpoint.mode full
+
+# Disable compilation (uses less memory)
+--compile.enable=false
+```
+
+#### Slow Inter-Node Communication
+
+```bash
+# For AWS EFA
+export FI_PROVIDER="efa"
+export FI_EFA_USE_HUGE_PAGE=0
+
+# For InfiniBand
+export NCCL_IB_DISABLE=0
+export NCCL_NET_GDR_LEVEL=5
+```
+
+#### Dataset Streaming Issues
+
+```bash
+# Increase dataloader workers
+--training.dataloader.num_workers 8
+
+# Enable pin memory
+--training.dataloader.pin_memory true
+```
+
+---
+
+## Part 10: Next Steps
+
+Now that you've trained models with TorchTitan, explore:
 
 1. **Tensor Parallelism**: See `torchtitan/models/llama3/infra/parallelize.py`
    for TP implementation
@@ -783,16 +1222,18 @@ Now that you've trained and evaluated GPT-2 with TorchTitan, explore:
 2. **Pipeline Parallelism**: See `torchtitan/distributed/pipeline_parallel.py`
 
 3. **FP8 Training**: Add `--model.converters="quantize.linear.float8"` for
-   H100/B200 GPUs
+   H100/B200 GPUs with even faster training
 
-4. **Larger Models**: Try Llama 3 8B with the production configs:
+4. **Larger Models**: Try Llama 3 70B or 405B with the production configs:
    ```bash
-   CONFIG_FILE="./torchtitan/models/llama3/train_configs/llama3_8b.toml" ./run_train.sh
+   CONFIG_FILE="./torchtitan/models/llama3/train_configs/llama3_70b.toml" ./run_train.sh
    ```
 
-5. **Custom Models**: Use the GPT-2 experiment as a template for your own models
+5. **MoE Models**: Train Qwen3-MoE or DeepSeek-V3 with expert parallelism
 
-6. **In-Training Validation**: Use the `Validator` class for validation during
+6. **Custom Models**: Use the GPT-2 experiment as a template for your own models
+
+7. **In-Training Validation**: Use the `Validator` class for validation during
    training (see `docs/evaluation.md`)
 
 ---
@@ -809,6 +1250,8 @@ In this tutorial, you learned:
 - ✅ How to add custom datasets
 - ✅ How to evaluate models using lm_eval benchmarks
 - ✅ How to convert checkpoints for HuggingFace compatibility
+- ✅ How to pretrain Qwen3 1.7B on multi-node clusters with HSDP
+- ✅ How to configure and monitor large-scale distributed training
 
 TorchTitan provides a clean, modular framework for distributed LLM training.
 The patterns you learned here apply to any model architecture!

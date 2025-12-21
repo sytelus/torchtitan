@@ -54,6 +54,20 @@ def _process_shakespeare_text(sample: dict[str, Any]) -> str:
     return sample["text"]
 
 
+def _load_climbmix_dataset(dataset_path: str):
+    """Load ClimbMix dataset (OptimalScale/ClimbMix on HuggingFace).
+
+    ClimbMix is a large-scale pretraining dataset with ~395M samples (~400B tokens).
+    Data is grouped into 1000 topic clusters with advertisement detection applied.
+    """
+    return load_dataset(dataset_path, split="train", streaming=True)
+
+
+def _process_climbmix_text(sample: dict[str, Any]) -> str:
+    """Process ClimbMix dataset sample text."""
+    return sample["text"]
+
+
 # Add your dataset here - more information at docs/datasets.md
 DATASETS = {
     "c4": DatasetConfig(
@@ -84,6 +98,14 @@ DATASETS = {
         path="karpathy/tiny_shakespeare",
         loader=_load_tiny_shakespeare_dataset,
         sample_processor=_process_shakespeare_text,
+    ),
+    # ClimbMix dataset (from OptimalScale/ClimbMix on HuggingFace)
+    # Large-scale pretraining dataset: ~395M samples, ~400B tokens
+    # Filtered and mixed data with 1000 topic clusters
+    "climbmix": DatasetConfig(
+        path="OptimalScale/ClimbMix",
+        loader=_load_climbmix_dataset,
+        sample_processor=_process_climbmix_text,
     ),
 }
 
