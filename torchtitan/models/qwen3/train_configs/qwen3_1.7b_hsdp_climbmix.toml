@@ -40,7 +40,7 @@ decay_type = "cosine"
 local_batch_size = 8          # Per-GPU batch size
 seq_len = 4096                # Qwen3 default context length
 max_norm = 1.0                # Gradient clipping
-steps = 200000                # ~400B tokens with global batch 1M tokens/step
+steps = 200000                # ~200B tokens (200K steps × 1M tokens/step)
 dataset = "climbmix"
 mixed_precision = "bfloat16"  # BF16 mixed precision for B200
 

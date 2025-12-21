@@ -918,38 +918,222 @@ Configuration for 32 GPUs (4 nodes × 8 GPUs):
 The optimized configuration file is at:
 `torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix.toml`
 
-Key settings:
+#### Configuration with Explanations
 
 ```toml
 [model]
 name = "qwen3"
 flavor = "1.7B"
 hf_assets_path = "./assets/hf/Qwen3-1.7B"
+```
 
+**Model Selection Rationale:**
+- **Qwen3 1.7B** is chosen as a balance between training time and model capability
+- Large enough to learn meaningful representations (~1.7B parameters)
+- Small enough to train efficiently on 32 GPUs without excessive parallelism complexity
+- Uses the Qwen3 architecture: RoPE, GQA (16 heads, 8 KV heads), SwiGLU activation
+
+---
+
+```toml
+[optimizer]
+name = "AdamW"
+lr = 3e-4
+eps = 1e-8
+fused = true
+```
+
+**Optimizer Rationale:**
+- **lr = 3e-4**: Standard learning rate for 1-2B parameter models. Based on scaling laws:
+  - Smaller models (100M-500M) often use 6e-4 to 1e-3
+  - Larger models (7B+) typically use 1e-4 to 3e-4
+  - 3e-4 is the "Chinchilla optimal" range for this model size
+- **fused = true**: Uses CUDA fused AdamW kernel, ~20% faster than standard AdamW
+- **eps = 1e-8**: Default epsilon for numerical stability
+
+---
+
+```toml
+[lr_scheduler]
+warmup_steps = 2000
+decay_ratio = 0.1
+decay_type = "cosine"
+```
+
+**LR Scheduler Rationale:**
+- **warmup_steps = 2000**: ~1% of total training (200K steps)
+  - Warmup prevents early training instability with large batch sizes
+  - Rule of thumb: 0.5-2% of total steps for warmup
+  - With 32 GPUs and large global batch, warmup is critical
+- **decay_ratio = 0.1**: Final LR is 10% of peak (3e-5)
+  - Allows model to converge to sharper minima at end of training
+  - Values between 0.0-0.1 are standard
+- **decay_type = "cosine"**: Smooth decay, widely used for LLM pretraining
+  - Better than linear decay for long training runs
+  - Matches Llama, GPT-3, and other foundation model recipes
+
+---
+
+```toml
 [training]
-local_batch_size = 8          # 8 samples × 4096 tokens × 32 GPUs = 1M tokens/step
+local_batch_size = 8
 seq_len = 4096
-steps = 200000                # ~200B tokens total
+max_norm = 1.0
+steps = 200000
 dataset = "climbmix"
 mixed_precision = "bfloat16"
+```
 
+**Training Hyperparameters Rationale:**
+
+- **local_batch_size = 8**: Per-GPU batch size
+  - Global batch = 8 × 32 GPUs = 256 sequences
+  - Tokens per step = 256 × 4096 = **1,048,576 tokens (~1M)**
+  - B200 with 192GB HBM3 can handle batch size 8-16 for 1.7B model
+  - Larger batches improve GPU utilization but may hurt convergence
+
+- **seq_len = 4096**: Qwen3's default context length
+  - Matches the model's pre-configured `max_seq_len`
+  - Longer sequences (8K+) would require more memory or context parallelism
+
+- **max_norm = 1.0**: Gradient clipping threshold
+  - Standard value for LLM training, prevents gradient explosions
+  - Values 0.5-1.0 are typical; lower values (0.5) for unstable training
+
+- **steps = 200000**: Total training steps
+  - Total tokens = 200K steps × 1M tokens/step = **200B tokens**
+  - ClimbMix has ~400B tokens, so we train on ~50% of the dataset
+  - Chinchilla-optimal for 1.7B model is ~34B tokens (20× params)
+  - We overtrain 6× for better downstream performance
+
+- **mixed_precision = "bfloat16"**: BF16 mixed precision training
+  - BF16 preferred over FP16 for training stability (larger dynamic range)
+  - B200 GPUs have excellent BF16 performance (2.25 PFLOPS)
+  - Reduces memory by ~50% compared to FP32
+
+---
+
+```toml
 [parallelism]
-data_parallel_replicate_degree = 4    # DDP across 4 nodes
-data_parallel_shard_degree = 8        # FSDP within 8 GPUs/node
+data_parallel_replicate_degree = 4
+data_parallel_shard_degree = 8
+fsdp_reshard_after_forward = "default"
+tensor_parallel_degree = 1
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+```
 
-[metrics]
-enable_wandb = true           # Enable WandB logging
-log_freq = 10                 # Log every 10 steps
+**Parallelism Strategy Rationale:**
 
+- **data_parallel_shard_degree = 8**: FSDP within each node
+  - Shards model parameters across 8 GPUs per node
+  - Uses NVLink (900 GB/s on B200) for all-gather/reduce-scatter
+  - Memory per GPU: ~1.7B params × 2 bytes / 8 = ~425MB model weights
+  - With optimizer states (8 bytes/param): ~1.7GB per GPU
+
+- **data_parallel_replicate_degree = 4**: DDP across 4 nodes
+  - Each node has a complete sharded replica
+  - Gradient sync uses inter-node network (400 Gb/s EFA/IB)
+  - DDP communication is just gradient all-reduce (lighter than FSDP)
+
+- **Why HSDP over pure FSDP?**
+  - Pure FSDP (dp_shard=32) would require all-gather across nodes
+  - Inter-node bandwidth is 10-20× slower than intra-node NVLink
+  - HSDP minimizes cross-node communication
+
+- **tensor_parallel_degree = 1**: TP disabled
+  - Qwen3 1.7B fits comfortably in memory without TP
+  - TP adds communication overhead, only needed for very large models (70B+)
+
+- **context_parallel_degree = 1**: CP disabled
+  - Not needed for 4096 sequence length
+  - CP is for very long sequences (32K+) that don't fit in memory
+
+---
+
+```toml
 [checkpoint]
 enable = true
+folder = "checkpoint"
 interval = 5000
-async_mode = "async"          # Non-blocking checkpoints
-last_save_in_hf = true        # Export final checkpoint to HuggingFace format
-
-[compile]
-enable = true                 # torch.compile for performance
+last_save_model_only = false
+export_dtype = "bfloat16"
+async_mode = "async"
+last_save_in_hf = true
 ```
+
+**Checkpointing Rationale:**
+
+- **interval = 5000**: Save every 5000 steps (~1.5-2 hours of training)
+  - Balance between checkpoint overhead and recovery granularity
+  - At 200K total steps, this creates ~40 checkpoints
+  - If training crashes, maximum loss is 5000 steps
+
+- **async_mode = "async"**: Non-blocking checkpoint saves
+  - Training continues while checkpoint is written to disk
+  - Reduces checkpoint overhead from minutes to near-zero
+  - Requires sufficient CPU memory to buffer checkpoint
+
+- **export_dtype = "bfloat16"**: Save weights in BF16
+  - Matches training precision, no conversion loss
+  - Smaller checkpoint files than FP32
+
+- **last_save_in_hf = true**: Auto-export final checkpoint
+  - Converts to HuggingFace safetensors format
+  - Ready for inference or lm_eval without manual conversion
+
+---
+
+```toml
+[activation_checkpoint]
+mode = "selective"
+selective_ac_option = "op"
+```
+
+**Activation Checkpointing Rationale:**
+
+- **mode = "selective"**: Checkpoint only high-memory operations
+  - Recomputes attention and FFN activations during backward pass
+  - Reduces memory by ~30-40% with minimal compute overhead (~10%)
+  - "full" mode saves more memory but adds ~30% compute overhead
+
+- **selective_ac_option = "op"**: Operation-based selection
+  - Automatically selects which ops to checkpoint based on memory/compute tradeoff
+  - Alternative: "int" = checkpoint every N layers
+
+---
+
+```toml
+[compile]
+enable = true
+components = ["model", "loss"]
+```
+
+**Compilation Rationale:**
+
+- **enable = true**: Use torch.compile for kernel fusion
+  - Fuses operations like LayerNorm + attention into optimized kernels
+  - Typically 10-30% speedup for transformer models
+  - First few steps are slower due to compilation (one-time cost)
+
+- **components = ["model", "loss"]**: What to compile
+  - Compiles the model forward pass and loss computation
+  - Optimizer is not compiled (already uses fused kernels)
+
+---
+
+#### Summary: Key Numbers
+
+| Parameter | Value | Calculation/Reasoning |
+|-----------|-------|----------------------|
+| Global batch size | 256 | 8 per GPU × 32 GPUs |
+| Tokens per step | 1,048,576 | 256 × 4096 |
+| Total tokens | 200B | 200K steps × 1M tokens |
+| Peak LR | 3e-4 | Standard for 1-2B models |
+| Final LR | 3e-5 | 10% of peak (decay_ratio=0.1) |
+| Warmup tokens | 2B | 2000 steps × 1M tokens |
+| Memory per GPU | ~60-80GB | Model + optimizer + activations |
+| Checkpoint size | ~6.8GB | 1.7B × 2 bytes × 2 (model+optimizer) |
 
 ### 9.7 Launch Multi-Node Training
 
