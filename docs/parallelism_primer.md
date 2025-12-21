@@ -215,6 +215,183 @@ GPU holds `1/(tp × dp_shard)` of the model within a replica:
   - Tensorwise FP8 scaling can use FP8 all-gather with TP.
   - Rowwise FP8 uses higher-precision communication.
 
+## Model Architecture Constraints for Parallelism
+
+When using Tensor Parallelism (TP) or Context Parallelism (CP), certain model
+architecture parameters must satisfy divisibility constraints. These constraints
+arise from how the parallelism strategies shard weights and activations.
+
+### Tensor Parallelism Constraints
+
+TP shards weight matrices across GPUs. For this to work, the dimensions being
+split must be evenly divisible by the TP degree.
+
+#### 1. Attention Heads
+
+```
+Constraint: n_heads % tp_degree == 0
+            n_kv_heads % tp_degree == 0
+```
+
+**Why**: TP applies `ColwiseParallel` to the Q, K, V projection layers (wq, wk,
+wv), splitting them column-wise. Each TP rank receives a subset of attention
+heads:
+
+```
+                    Attention Head Sharding (tp=4)
+
+Original wq weight: [hidden_dim, n_heads × head_dim]
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ GPU 0: wq[:, 0:n_heads/4 × head_dim]      ← heads 0 to n_heads/4-1  │
+│ GPU 1: wq[:, n_heads/4:n_heads/2 × head_dim]  ← heads n_heads/4...  │
+│ GPU 2: wq[:, n_heads/2:3*n_heads/4 × head_dim]                      │
+│ GPU 3: wq[:, 3*n_heads/4:n_heads × head_dim]                        │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+If `n_heads` or `n_kv_heads` is not divisible by `tp_degree`, the sharding
+would produce unequal chunks, causing dimension mismatches.
+
+**Example**: Llama 3 8B has `n_heads=32` and `n_kv_heads=8`
+- TP=2: ✓ (32/2=16 heads, 8/2=4 KV heads per GPU)
+- TP=4: ✓ (32/4=8 heads, 8/4=2 KV heads per GPU)
+- TP=8: ✓ (32/8=4 heads, 8/8=1 KV head per GPU)
+- TP=16: ✗ (8/16=0.5 KV heads - not divisible!)
+
+#### 2. FFN Hidden Dimension
+
+```
+Constraint: ffn_hidden_dim % tp_degree == 0
+```
+
+**Why**: TP applies `ColwiseParallel` to FFN up-projections (w1, w3) and
+`RowwiseParallel` to the down-projection (w2):
+
+```
+FFN Sharding (tp=2):
+
+w1: [hidden, ffn_dim]  →  GPU0: [hidden, ffn_dim/2]
+                          GPU1: [hidden, ffn_dim/2]
+
+w2: [ffn_dim, hidden]  →  GPU0: [ffn_dim/2, hidden]
+                          GPU1: [ffn_dim/2, hidden]
+```
+
+The FFN hidden dimension (often 4× or 8/3× the model dimension) must be
+divisible by `tp_degree`.
+
+**Example**: With `hidden_dim=4096` and standard 8/3× multiplier:
+- `ffn_dim = 4096 × 8/3 ≈ 10923` → rounded to `multiple_of` (e.g., 14336)
+- TP=2: ✓ (14336/2=7168)
+- TP=8: ✓ (14336/8=1792)
+
+#### 3. Vocabulary Size (for Loss Parallel)
+
+```
+Constraint: vocab_size % tp_degree == 0  (when loss_parallel enabled)
+```
+
+**Why**: With loss parallel, the output projection layer is sharded column-wise
+across TP ranks. Each rank computes cross-entropy for its portion of the
+vocabulary:
+
+```
+Output Layer Sharding (tp=4, vocab=128K):
+
+output: [hidden, vocab_size]  →  GPU0: [hidden, 32K]  ← vocab tokens 0-32K
+                                  GPU1: [hidden, 32K]  ← vocab tokens 32K-64K
+                                  GPU2: [hidden, 32K]  ← vocab tokens 64K-96K
+                                  GPU3: [hidden, 32K]  ← vocab tokens 96K-128K
+```
+
+Most LLM vocabularies (32K, 128K, 256K) are powers of 2, making them divisible
+by common TP degrees (2, 4, 8).
+
+#### 4. Model Dimension (Embedding)
+
+```
+Constraint: dim % tp_degree == 0  (for sequence parallel)
+```
+
+**Why**: Sequence Parallel shards activations along the sequence dimension, but
+the embedding output and layer norms operate on the hidden dimension. The
+`RowwiseParallel` on embeddings requires the vocabulary dimension to be
+shardable.
+
+### Context Parallelism Constraints
+
+CP splits the sequence across GPUs using ring attention.
+
+#### Sequence Length
+
+```
+Constraint: seq_len % (tp_degree × cp_degree × 2) == 0
+```
+
+**Why**: The factor of 2 comes from load balancing in ring attention. CP
+processes causal attention by splitting the sequence into chunks, and the ring
+rotation pattern requires balanced chunk sizes:
+
+```
+Ring Attention Load Balancing (cp=4, seq=8192):
+
+Each chunk: 8192 / (4 × 2) = 1024 tokens
+
+The ×2 factor accounts for:
+- Causal masking creates triangular attention patterns
+- Without balancing, early chunks compute more attention than late chunks
+- The factor of 2 ensures work is evenly distributed across ring steps
+```
+
+**Example calculations**:
+- seq_len=4096, tp=1, cp=4: 4096 % (1×4×2) = 4096 % 8 = 0 ✓
+- seq_len=4096, tp=2, cp=2: 4096 % (2×2×2) = 4096 % 8 = 0 ✓
+- seq_len=32768, tp=1, cp=8: 32768 % (1×8×2) = 32768 % 16 = 0 ✓
+- seq_len=1000, tp=1, cp=4: 1000 % 8 = 0 ✓
+- seq_len=1000, tp=2, cp=4: 1000 % 16 = 8 ✗
+
+### Summary Table
+
+| Parameter | Constraint | Applies To | Reason |
+|-----------|------------|------------|--------|
+| `n_heads` | `% tp == 0` | TP | Query heads split across TP ranks |
+| `n_kv_heads` | `% tp == 0` | TP | KV heads split across TP ranks |
+| `ffn_hidden_dim` | `% tp == 0` | TP | FFN layers split column/row-wise |
+| `vocab_size` | `% tp == 0` | TP + Loss Parallel | Output logits sharded for loss |
+| `dim` | `% tp == 0` | TP + Sequence Parallel | Embedding and norm sharding |
+| `seq_len` | `% (tp × cp × 2) == 0` | CP | Ring attention load balancing |
+
+### Practical Guidance
+
+1. **Choose TP degree based on KV heads**: The `n_kv_heads` is often the most
+   restrictive constraint. Llama models use 8 KV heads, limiting TP to 1, 2, 4,
+   or 8.
+
+2. **Verify before training**: Check divisibility before launching:
+   ```python
+   assert model_args.n_heads % tp_degree == 0, \
+       f"n_heads ({model_args.n_heads}) must be divisible by tp ({tp_degree})"
+   assert model_args.n_kv_heads % tp_degree == 0, \
+       f"n_kv_heads ({model_args.n_kv_heads}) must be divisible by tp ({tp_degree})"
+   ```
+
+3. **Common valid configurations**:
+   | Model | n_heads | n_kv_heads | Valid TP degrees |
+   |-------|---------|------------|------------------|
+   | Llama 3 8B | 32 | 8 | 1, 2, 4, 8 |
+   | Llama 3 70B | 64 | 8 | 1, 2, 4, 8 |
+   | Llama 3 405B | 128 | 8 | 1, 2, 4, 8 |
+   | Qwen3 1.7B | 16 | 2 | 1, 2 |
+   | Qwen3 32B | 64 | 8 | 1, 2, 4, 8 |
+
+4. **Adjust seq_len for CP**: Round sequence length to satisfy the constraint:
+   ```python
+   divisor = tp_degree * cp_degree * 2
+   seq_len = (desired_seq_len // divisor) * divisor
+   ```
+
 ## Typical configurations
 
 - **Single GPU debug**:
