@@ -1394,6 +1394,177 @@ export NCCL_NET_GDR_LEVEL=5
 --training.dataloader.pin_memory true
 ```
 
+### 9.12 Switching from HSDP to Pure FSDP
+
+This section explains how to switch from HSDP (Hybrid Sharded Data Parallel) to
+pure FSDP (Fully Sharded Data Parallel) for Qwen3 1.7B training.
+
+#### When to Use FSDP Instead of HSDP
+
+| Scenario | Recommendation |
+|----------|----------------|
+| High-bandwidth inter-node network (800+ Gb/s) | FSDP may be faster |
+| Single node training | FSDP (HSDP not applicable) |
+| Maximum memory efficiency needed | FSDP shards across all GPUs |
+| Simpler configuration | FSDP has fewer parameters |
+| Lower inter-node bandwidth (<400 Gb/s) | **Keep HSDP** |
+| 4+ nodes with standard networking | **Keep HSDP** |
+
+#### HSDP vs FSDP Comparison
+
+```
+HSDP (Current Configuration)          Pure FSDP
+┌──────────────────────────────┐      ┌──────────────────────────────┐
+│  dp_replicate=4, dp_shard=8  │      │  dp_replicate=1, dp_shard=32 │
+├──────────────────────────────┤      ├──────────────────────────────┤
+│                              │      │                              │
+│  Node 0    Node 1            │      │  All 32 GPUs in one          │
+│  [8 GPUs]  [8 GPUs]          │      │  FSDP group                  │
+│     ↕         ↕              │      │                              │
+│   FSDP      FSDP             │      │  GPU 0 ←→ GPU 1 ←→ ... ←→ 31 │
+│     ↕         ↕              │      │                              │
+│  Node 2    Node 3            │      │  All-gather and reduce-      │
+│  [8 GPUs]  [8 GPUs]          │      │  scatter across ALL GPUs     │
+│                              │      │  (including cross-node)      │
+│  DDP sync across nodes       │      │                              │
+│  (gradient all-reduce only)  │      │                              │
+└──────────────────────────────┘      └──────────────────────────────┘
+
+Communication:                         Communication:
+- FSDP: intra-node (NVLink)           - FSDP: all GPUs (includes network)
+- DDP: inter-node (gradients only)    - More cross-node traffic
+```
+
+#### Step 1: Understand the Configuration Change
+
+The key change is in the `[parallelism]` section:
+
+```toml
+# HSDP Configuration (current)
+[parallelism]
+data_parallel_replicate_degree = 4    # 4 replicas (DDP across nodes)
+data_parallel_shard_degree = 8        # 8-way sharding (FSDP within nodes)
+# Product: 4 × 8 = 32 GPUs
+
+# Pure FSDP Configuration (target)
+[parallelism]
+data_parallel_replicate_degree = 1    # No replication
+data_parallel_shard_degree = 32       # 32-way sharding (FSDP across all GPUs)
+# Product: 1 × 32 = 32 GPUs
+```
+
+#### Step 2: Create FSDP Configuration File
+
+Create a new config file or modify the existing one:
+
+```bash
+# Copy the HSDP config
+cp torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix.toml \
+   torchtitan/models/qwen3/train_configs/qwen3_1.7b_fsdp_climbmix.toml
+```
+
+Edit the new file and change the parallelism section:
+
+```toml
+[parallelism]
+# Pure FSDP: shard across all 32 GPUs
+data_parallel_replicate_degree = 1    # No replication (changed from 4)
+data_parallel_shard_degree = -1       # Auto-calculate: uses all 32 GPUs
+fsdp_reshard_after_forward = "default"
+tensor_parallel_degree = 1
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+```
+
+**Note:** Setting `data_parallel_shard_degree = -1` automatically calculates the
+shard degree based on available GPUs (32 in this case).
+
+#### Step 3: Adjust for Memory and Performance
+
+With pure FSDP, you may need to adjust other settings:
+
+```toml
+[training]
+# FSDP may allow slightly larger batch sizes due to better memory distribution
+local_batch_size = 8    # Can try 10-12 with pure FSDP
+
+[activation_checkpoint]
+# May need more aggressive checkpointing with FSDP
+mode = "selective"      # Keep as-is, or use "full" if OOM
+```
+
+#### Step 4: Launch Training with FSDP
+
+Using the new config file:
+
+```bash
+# With Slurm
+CONFIG_FILE="./torchtitan/models/qwen3/train_configs/qwen3_1.7b_fsdp_climbmix.toml"
+sbatch multinode_trainer.slurm
+
+# Or via command-line override (without creating new file)
+torchrun --nnodes 4 --nproc_per_node 8 ... \
+    --job.config_file ./torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix.toml \
+    --parallelism.data_parallel_replicate_degree 1 \
+    --parallelism.data_parallel_shard_degree -1
+```
+
+#### Step 5: Compare Performance
+
+Run both configurations and compare metrics in WandB:
+
+| Metric | HSDP Expected | FSDP Expected | Notes |
+|--------|---------------|---------------|-------|
+| Tokens/s | 1.5-2M | 1.2-1.8M | FSDP may be slower with standard networking |
+| Memory/GPU | 60-80GB | 50-70GB | FSDP may use less memory |
+| MFU | 40-50% | 35-45% | HSDP typically has better MFU |
+| Startup time | Faster | Slower | FSDP needs to shard across network |
+
+#### When to Choose Each Option
+
+**Choose HSDP when:**
+- You have 4+ nodes with standard inter-node networking
+- Maximum throughput is the priority
+- Network bandwidth is limited (< 400 Gb/s)
+
+**Choose FSDP when:**
+- You have very high-bandwidth networking (NVLink across nodes, 800+ Gb/s)
+- You need maximum memory efficiency (larger models)
+- Simpler configuration is preferred
+- Single-node training (HSDP not applicable)
+
+#### Quick Reference: Common Configurations
+
+```toml
+# Single Node (8 GPUs) - Pure FSDP only option
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 8
+
+# 2 Nodes (16 GPUs) - HSDP
+data_parallel_replicate_degree = 2
+data_parallel_shard_degree = 8
+
+# 2 Nodes (16 GPUs) - Pure FSDP
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 16
+
+# 4 Nodes (32 GPUs) - HSDP (recommended)
+data_parallel_replicate_degree = 4
+data_parallel_shard_degree = 8
+
+# 4 Nodes (32 GPUs) - Pure FSDP
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 32
+
+# 8 Nodes (64 GPUs) - HSDP
+data_parallel_replicate_degree = 8
+data_parallel_shard_degree = 8
+
+# 8 Nodes (64 GPUs) - Alternative HSDP (larger shards)
+data_parallel_replicate_degree = 4
+data_parallel_shard_degree = 16
+```
+
 ---
 
 ## Part 10: Next Steps
