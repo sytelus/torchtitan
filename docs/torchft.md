@@ -85,7 +85,7 @@ For complete configuration options, run `NGPU=1 ./run_train.sh --help`.
 - `--fault_tolerance.sync_steps`: The number of training steps before synchronization.
 - `--fault_tolerance.semi_sync_method`: Synchronization method (e.g., "local_sgd", "diloco")
 
-For more semi-synchronouse configuration options, see [ft/config/job_config.py](config/job_config.py).
+For more semi-synchronous configuration options, see [ft/config/job_config.py](../torchtitan/components/ft/config/job_config.py).
 
 ## Environment Variables
 
