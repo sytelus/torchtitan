@@ -1565,6 +1565,370 @@ data_parallel_replicate_degree = 4
 data_parallel_shard_degree = 16
 ```
 
+### 9.13 Switching from BF16 to FP8 Mixed Precision
+
+This section explains how to switch from BF16 to FP8 mixed precision training
+for improved performance on H100/B200 GPUs.
+
+#### Overview: FP8 Training Options
+
+TorchTitan supports multiple FP8 training modes:
+
+| Mode | Hardware | Scaling | Use Case |
+|------|----------|---------|----------|
+| **Float8 Tensorwise** | H100, H200, B200 | 1 scale per tensor | Maximum throughput |
+| **Float8 Rowwise** | H100, H200, B200 | 1 scale per row | Better accuracy |
+| **MXFP8** | B200 only | 1 scale per 32 elements | Best accuracy + speed on B200 |
+
+#### Dependencies: Installing TorchAO
+
+FP8 training requires TorchAO. The installation method depends on your hardware
+and requirements:
+
+**Option 1: Install from PyPI (Recommended for H100/H200)**
+
+```bash
+# Install TorchAO nightly
+USE_CPP=0 pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu126
+
+# For CUDA 12.8 (B200)
+USE_CPP=0 pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
+```
+
+**Option 2: Build from Source (Required for GB200 or latest features)**
+
+Build TorchAO from source when:
+- Using GB200 (NVLink-connected B200 pairs) - required for MXFP8
+- Need the latest prototype features not yet in nightly
+- Encountering compatibility issues with PyTorch nightly
+
+```bash
+# Build TorchAO from source
+USE_CPP=0 pip install git+https://github.com/pytorch/ao.git
+
+# Verify installation
+python -c "import torchao; print(f'TorchAO version: {torchao.__version__}')"
+```
+
+**The `USE_CPP=0` flag**: Disables C++ extensions during build. Use this when:
+- You don't need C++ optimizations
+- C++ compilation fails due to missing dependencies
+- You want faster installation
+
+#### Step 1: Understand FP8 Scaling Types
+
+```
+BF16 Training (Current)           FP8 Tensorwise              FP8 Rowwise / MXFP8
+┌────────────────────┐           ┌────────────────────┐      ┌────────────────────┐
+│                    │           │                    │      │                    │
+│  tensor [BF16]     │           │  tensor [FP8]      │      │  tensor [FP8]      │
+│  16 bits/element   │           │  8 bits/element    │      │  8 bits/element    │
+│  No scaling needed │           │  + 1 global scale  │      │  + N row scales    │
+│                    │           │                    │      │  (or N×M/32 blocks)│
+│                    │           │  FP8 all-gather ✓  │      │  BF16 all-gather   │
+└────────────────────┘           └────────────────────┘      └────────────────────┘
+
+Memory:    Full                   ~50% weights               ~50% weights
+Comm:      Full                   ~50% (FP8 all-gather)      Full (BF16)
+Accuracy:  Baseline               Lower                       Higher
+```
+
+#### Step 2: Enable Float8 Tensorwise (H100/H200/B200)
+
+This is the recommended starting point for FP8 training:
+
+**Via Command Line:**
+
+```bash
+torchrun --nnodes 4 --nproc_per_node 8 ... \
+    --job.config_file ./torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix.toml \
+    --model.converters="quantize.linear.float8" \
+    --quantize.linear.float8.enable_fsdp_float8_all_gather \
+    --quantize.linear.float8.precompute_float8_dynamic_scale_for_fsdp \
+    --compile.enable
+```
+
+**Via TOML Config:**
+
+Create `qwen3_1.7b_hsdp_climbmix_fp8.toml`:
+
+```toml
+# Copy all settings from qwen3_1.7b_hsdp_climbmix.toml, then add:
+
+[model]
+name = "qwen3"
+flavor = "1.7B"
+hf_assets_path = "./assets/hf/Qwen3-1.7B"
+converters = ["quantize.linear.float8"]  # Enable FP8
+
+[quantize.linear.float8]
+# Tensorwise scaling with FSDP optimizations
+enable_fsdp_float8_all_gather = true              # FP8 communication (50% bandwidth savings)
+precompute_float8_dynamic_scale_for_fsdp = true   # Efficient scale all-reduce
+filter_fqns = ["output"]                          # Skip output layer (small K dimension)
+
+[compile]
+enable = true  # Required for competitive FP8 performance
+components = ["model", "loss"]
+```
+
+**Configuration Explained:**
+
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| `converters` | `["quantize.linear.float8"]` | Enables Float8Linear conversion |
+| `enable_fsdp_float8_all_gather` | `true` | All-gather in FP8 (halves communication) |
+| `precompute_float8_dynamic_scale_for_fsdp` | `true` | Single all-reduce for all scales |
+| `filter_fqns` | `["output"]` | Skip layers too small to benefit |
+| `compile.enable` | `true` | Fuses FP8 scaling kernels (required!) |
+
+#### Step 3: Enable Float8 Rowwise (Higher Accuracy)
+
+If tensorwise shows accuracy issues, try rowwise scaling:
+
+```bash
+torchrun ... \
+    --model.converters="quantize.linear.float8" \
+    --quantize.linear.float8.recipe_name="rowwise" \
+    --compile.enable
+```
+
+**Via TOML:**
+
+```toml
+[model]
+converters = ["quantize.linear.float8"]
+
+[quantize.linear.float8]
+recipe_name = "rowwise"  # Per-row scaling for better accuracy
+# Note: FP8 all-gather not supported with rowwise
+filter_fqns = ["output"]
+
+[compile]
+enable = true
+```
+
+**Rowwise vs Tensorwise Trade-offs:**
+
+| Aspect | Tensorwise | Rowwise |
+|--------|------------|---------|
+| Accuracy | Lower | Higher |
+| FSDP Communication | FP8 (50% savings) | BF16 (full) |
+| Best for | Large models, bandwidth-bound | Accuracy-critical |
+
+#### Step 4: Enable MXFP8 (B200 GPUs Only)
+
+MXFP8 provides the best combination of speed and accuracy on B200 GPUs:
+
+**Hardware Requirements:**
+- NVIDIA B200 (SM100) or B200A (SM100a)
+- GB200 requires building TorchAO from source
+- TorchAO v0.14.0+ or nightly
+
+**Via Command Line:**
+
+```bash
+torchrun --nnodes 4 --nproc_per_node 8 ... \
+    --job.config_file ./torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix.toml \
+    --model.converters="quantize.linear.mx" \
+    --quantize.linear.mx.recipe_name="mxfp8_cublas" \
+    --compile.enable
+```
+
+**Via TOML Config:**
+
+Create `qwen3_1.7b_hsdp_climbmix_mxfp8.toml`:
+
+```toml
+[model]
+name = "qwen3"
+flavor = "1.7B"
+hf_assets_path = "./assets/hf/Qwen3-1.7B"
+converters = ["quantize.linear.mx"]  # Enable MXFP8
+
+[quantize.linear.mx]
+recipe_name = "mxfp8_cublas"              # cuBLAS-based MXFP8 (recommended)
+mxfp8_dim1_cast_kernel_choice = "cuda"    # Options: "triton", "cuda", "torch"
+filter_fqns = ["output"]                  # Skip output layer
+
+[compile]
+enable = true  # Required for MXFP8 performance
+components = ["model", "loss"]
+```
+
+**MXFP8 Configuration Explained:**
+
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| `converters` | `["quantize.linear.mx"]` | Enables MXLinear conversion |
+| `recipe_name` | `"mxfp8_cublas"` | Best performance on B200 |
+| `mxfp8_dim1_cast_kernel_choice` | `"cuda"` | Fastest quantization kernel |
+| `filter_fqns` | `["output"]` | Skip small layers |
+
+**Alternative recipe:** `"mxfp8_cublas_rceil"` uses round-ceiling for scale
+calculation (slightly slower but may improve numerical stability).
+
+#### Step 5: Auto-Filter Small Layers
+
+Layers with small dimensions don't benefit from FP8. Enable auto-filtering:
+
+```toml
+[quantize.linear.float8]
+filter_fqns = ["output", "auto_filter_small_kn"]  # Auto-skip small layers
+```
+
+This automatically excludes Linear layers where the GEMM isn't large enough
+for FP8 speedup to outweigh quantization overhead.
+
+**Hardware requirements for FP8:**
+- All dimensions must be divisible by 16 (tensor core requirement)
+- Layers not meeting this are automatically skipped
+
+#### Step 6: Compare Performance
+
+Run benchmarks with different precision modes:
+
+```bash
+# BF16 baseline
+CONFIG_FILE="./torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix.toml" \
+    sbatch multinode_trainer.slurm
+
+# Float8 tensorwise
+CONFIG_FILE="./torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix_fp8.toml" \
+    sbatch multinode_trainer.slurm
+
+# MXFP8 (B200 only)
+CONFIG_FILE="./torchtitan/models/qwen3/train_configs/qwen3_1.7b_hsdp_climbmix_mxfp8.toml" \
+    sbatch multinode_trainer.slurm
+```
+
+**Expected Performance (Llama3-8B reference on 8×B200):**
+
+| Mode | Tokens/s | Speedup | Memory |
+|------|----------|---------|--------|
+| BF16 | 8,307 | baseline | 33.7 GB |
+| Float8 tensorwise | 10,417 | +25% | 33.4 GB |
+| MXFP8 cublas | 9,969 | +20% | 33.9 GB |
+
+*Note: Actual results vary by model size, batch size, and hardware.*
+
+#### Decision Guide: Which FP8 Mode to Use
+
+```
+                    ┌─────────────────────────────┐
+                    │ What GPU do you have?       │
+                    └─────────────────────────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              ▼                ▼                ▼
+         ┌────────┐      ┌──────────┐     ┌─────────┐
+         │  H100  │      │   H200   │     │   B200  │
+         │  H800  │      │          │     │  GB200  │
+         └────────┘      └──────────┘     └─────────┘
+              │                │                │
+              ▼                ▼                ▼
+    ┌─────────────────────────────────┐  ┌──────────────┐
+    │ Float8 Tensorwise (recommended) │  │ Try MXFP8    │
+    │ Float8 Rowwise (if accuracy)    │  │ first (best  │
+    └─────────────────────────────────┘  │ accuracy)    │
+                                         └──────────────┘
+                                               │
+                              ┌────────────────┼────────────────┐
+                              ▼                                 ▼
+                    ┌─────────────────┐              ┌─────────────────┐
+                    │ MXFP8 works?    │              │ Fallback to     │
+                    │ Use it!         │              │ Float8 tensorwise│
+                    └─────────────────┘              └─────────────────┘
+```
+
+**Summary Recommendations:**
+
+| Hardware | Recommended Mode | Why |
+|----------|-----------------|-----|
+| H100/H200 | Float8 tensorwise | Best throughput, FP8 all-gather |
+| B200 | MXFP8 | Best accuracy + good speed |
+| GB200 | MXFP8 (build from source) | Native support, best accuracy |
+| Any (accuracy issues) | Float8 rowwise | Better numerical stability |
+
+#### Troubleshooting FP8
+
+**1. TorchAO Import Error**
+
+```bash
+# Error: No module named 'torchao'
+# Solution: Install TorchAO
+USE_CPP=0 pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
+```
+
+**2. CUDA Capability Error (SM89 required)**
+
+```bash
+# Error: Float8 requires SM89 or newer
+# Solution: You need H100/H200/B200 GPUs. For testing without FP8 hardware:
+--quantize.linear.float8.emulate=true  # CPU emulation (slow, testing only)
+```
+
+**3. Dimension Not Divisible by 16**
+
+```bash
+# Warning: Skipping layer X - dimensions not divisible by 16
+# This is expected. FP8 tensor cores require 16-element alignment.
+# Use filter_fqns to explicitly skip these layers.
+```
+
+**4. MXFP8 Not Available on H100**
+
+```bash
+# Error: MXFP8 requires B200 (SM100)
+# Solution: Use Float8 instead
+--model.converters="quantize.linear.float8"
+```
+
+**5. GB200 MXFP8 Not Working**
+
+```bash
+# Error: MXFP8 kernels not found
+# Solution: Build TorchAO from source for GB200 support
+USE_CPP=0 pip install git+https://github.com/pytorch/ao.git
+```
+
+**6. Accuracy Degradation**
+
+```bash
+# If loss is unstable or accuracy drops:
+# Option 1: Try rowwise scaling
+--quantize.linear.float8.recipe_name="rowwise"
+
+# Option 2: Filter more layers
+--quantize.linear.float8.filter_fqns="output,attention.wq,attention.wk,attention.wv"
+
+# Option 3: Use MXFP8 on B200 (better accuracy)
+--model.converters="quantize.linear.mx"
+```
+
+#### Quick Reference: FP8 Commands
+
+```bash
+# BF16 (baseline)
+--training.mixed_precision="bfloat16"
+
+# Float8 Tensorwise (H100/H200/B200)
+--model.converters="quantize.linear.float8" \
+--quantize.linear.float8.enable_fsdp_float8_all_gather \
+--quantize.linear.float8.precompute_float8_dynamic_scale_for_fsdp \
+--compile.enable
+
+# Float8 Rowwise (H100/H200/B200, better accuracy)
+--model.converters="quantize.linear.float8" \
+--quantize.linear.float8.recipe_name="rowwise" \
+--compile.enable
+
+# MXFP8 (B200 only)
+--model.converters="quantize.linear.mx" \
+--quantize.linear.mx.recipe_name="mxfp8_cublas" \
+--compile.enable
+```
+
 ---
 
 ## Part 10: Next Steps
