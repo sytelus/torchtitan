@@ -266,11 +266,31 @@ NGPU=1 CONFIG_FILE="./torchtitan/experiments/gpt2/train_configs/debug_model.toml
     ./run_train.sh --metrics.enable_wandb
 ```
 
-Make sure you've logged into WandB:
+**WandB Authentication:**
 
+For interactive environments:
 ```bash
 wandb login
 ```
+
+For clusters and non-interactive environments, use environment variables:
+```bash
+# Required: API key (get from https://wandb.ai/authorize)
+export WANDB_API_KEY="your-api-key-here"
+
+# Optional: For self-hosted WandB servers
+export WANDB_BASE_URL="https://your-wandb-server.com"
+
+# Optional: Project and team configuration
+export WANDB_PROJECT="torchtitan"      # Project name (default: torchtitan)
+export WANDB_TEAM="your-team-name"     # Entity/team name
+export WANDB_RUN_NAME="gpt2-debug"     # Custom run name
+export WANDB_RUN_GROUP="experiment-1"  # Group related runs
+export WANDB_RUN_TAGS="debug,gpt2"     # Comma-separated tags
+export WANDB_RUN_NOTES="Testing GPT-2 training"  # Run description
+```
+
+**Tip:** Add these to your `.bashrc` or Slurm job script for persistent configuration.
 
 ### 4.4 Run Training
 
@@ -865,14 +885,65 @@ This downloads:
 Configure Weights & Biases for metrics visualization:
 
 ```bash
-# On the head node (or all nodes if using Slurm)
+# Install WandB
 pip install wandb
-wandb login
-
-# Set project and entity (optional)
-export WANDB_PROJECT="qwen3-pretraining"
-export WANDB_ENTITY="your-team-name"
 ```
+
+**For interactive environments:**
+```bash
+wandb login
+```
+
+**For clusters (Slurm, PBS, etc.) - use environment variables:**
+
+Add these to your job submission script or `.bashrc`:
+
+```bash
+# Required: API key from https://wandb.ai/authorize
+export WANDB_API_KEY="your-api-key-here"
+
+# Optional: For self-hosted WandB servers
+export WANDB_BASE_URL="https://your-wandb-server.com"
+
+# Project configuration
+export WANDB_PROJECT="qwen3-pretraining"
+export WANDB_TEAM="your-team-name"        # Entity/organization
+export WANDB_RUN_NAME="qwen3-2node-run"   # Custom run name
+export WANDB_RUN_GROUP="pretraining"      # Group related runs
+```
+
+**Example Slurm job script:**
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=qwen3-pretrain
+#SBATCH --nodes=2
+#SBATCH --gpus-per-node=8
+
+# WandB configuration (no interactive login needed)
+export WANDB_API_KEY="${WANDB_API_KEY}"  # Set in your environment
+export WANDB_PROJECT="qwen3-pretraining"
+export WANDB_RUN_NAME="qwen3-${SLURM_JOB_ID}"
+
+# Run training...
+```
+
+**All supported WandB environment variables:**
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `WANDB_API_KEY` | API key for authentication | Required |
+| `WANDB_BASE_URL` | Self-hosted server URL | wandb.ai |
+| `WANDB_PROJECT` | Project name | `torchtitan` |
+| `WANDB_TEAM` | Team/entity name | None |
+| `WANDB_RUN_NAME` | Run display name | Auto-generated |
+| `WANDB_RUN_ID` | Run ID (for resuming) | Auto-generated |
+| `WANDB_RUN_GROUP` | Group related runs | None |
+| `WANDB_RUN_TAGS` | Comma-separated tags | None |
+| `WANDB_RUN_NOTES` | Run description | None |
+| `WANDB_RUN_JOB_TYPE` | Job type label | None |
+| `WANDB_RESUME_FROM` | Resume from run ID | None |
+| `WANDB_FORK_FROM` | Fork from run ID | None |
 
 ### 9.5 Understanding HSDP Configuration
 
