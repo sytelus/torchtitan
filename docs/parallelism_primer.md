@@ -287,38 +287,98 @@ divisible by `tp_degree`.
 - TP=2: ✓ (14336/2=7168)
 - TP=8: ✓ (14336/8=1792)
 
-#### 3. Vocabulary Size (for Loss Parallel)
+#### 3. Vocabulary Size (Embedding and Output Layers)
 
 ```
-Constraint: vocab_size % tp_degree == 0  (when loss_parallel enabled)
+Constraint: vocab_size % tp_degree == 0
 ```
 
-**Why**: With loss parallel, the output projection layer is sharded column-wise
-across TP ranks. Each rank computes cross-entropy for its portion of the
-vocabulary:
+**Why**: Both the embedding layer and output projection layer involve the
+vocabulary dimension, and both are sharded across TP ranks.
+
+**Embedding layer** (`tok_embeddings`): Uses `RowwiseParallel`, which shards
+the embedding weight matrix along the vocabulary (row) dimension:
+
+```
+Embedding Weight Sharding (tp=4, vocab=128K):
+
+nn.Embedding weight: [vocab_size, dim]  →  [128K, 4096]
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ GPU 0: weight[0:32K, :]       ← embeddings for vocab tokens 0-32K    │
+│ GPU 1: weight[32K:64K, :]     ← embeddings for vocab tokens 32K-64K  │
+│ GPU 2: weight[64K:96K, :]     ← embeddings for vocab tokens 64K-96K  │
+│ GPU 3: weight[96K:128K, :]    ← embeddings for vocab tokens 96K-128K │
+└──────────────────────────────────────────────────────────────────────┘
+
+Input token IDs are Replicated across TP ranks.
+Each rank looks up embeddings only for its vocab shard.
+Output is Shard(1) - sharded on sequence dimension for Sequence Parallel.
+```
+
+**Output layer** (`output`): Uses `ColwiseParallel`, which shards the
+projection weight along the vocabulary (column) dimension:
 
 ```
 Output Layer Sharding (tp=4, vocab=128K):
 
-output: [hidden, vocab_size]  →  GPU0: [hidden, 32K]  ← vocab tokens 0-32K
-                                  GPU1: [hidden, 32K]  ← vocab tokens 32K-64K
-                                  GPU2: [hidden, 32K]  ← vocab tokens 64K-96K
-                                  GPU3: [hidden, 32K]  ← vocab tokens 96K-128K
+output weight: [dim, vocab_size]  →  [4096, 128K]
+                      │
+                      ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ GPU 0: weight[:, 0:32K]       ← logits for vocab tokens 0-32K        │
+│ GPU 1: weight[:, 32K:64K]     ← logits for vocab tokens 32K-64K      │
+│ GPU 2: weight[:, 64K:96K]     ← logits for vocab tokens 64K-96K      │
+│ GPU 3: weight[:, 96K:128K]    ← logits for vocab tokens 96K-128K     │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 Most LLM vocabularies (32K, 128K, 256K) are powers of 2, making them divisible
 by common TP degrees (2, 4, 8).
 
-#### 4. Model Dimension (Embedding)
+#### 4. Loss Parallel (Requires TP)
+
+Loss Parallel is **not a separate parallelism dimension**—it is an optimization
+that works with Tensor Parallelism. Key points:
+
+```python
+# From train.py - Loss Parallel requires TP to be enabled
+loss_parallel_enabled = (
+    parallel_dims.tp_enabled
+    and not job_config.parallelism.disable_loss_parallel
+)
+```
+
+**Relationship to TP**:
+- Loss Parallel uses the **same mesh and degree as TP**
+- It is enabled automatically when TP is enabled (unless explicitly disabled)
+- The output logits are already sharded across TP ranks (from ColwiseParallel)
+- Loss Parallel computes cross-entropy on each TP rank's vocab shard, then
+  reduces the loss across ranks
 
 ```
-Constraint: dim % tp_degree == 0  (for sequence parallel)
+Loss Parallel Flow (tp=4):
+
+                    Logits: [batch, seq, 32K] per GPU (vocab sharded)
+                                    │
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+            GPU 0: CE loss    GPU 1: CE loss    GPU 2: CE loss    GPU 3: CE loss
+            (vocab 0-32K)     (vocab 32K-64K)   (vocab 64K-96K)   (vocab 96K-128K)
+                    │               │               │               │
+                    └───────────────┴───────────────┴───────────────┘
+                                    │
+                                    ▼
+                            All-reduce loss
+                                    │
+                                    ▼
+                            Final scalar loss
 ```
 
-**Why**: Sequence Parallel shards activations along the sequence dimension, but
-the embedding output and layer norms operate on the hidden dimension. The
-`RowwiseParallel` on embeddings requires the vocabulary dimension to be
-shardable.
+**Memory benefit**: Without loss parallel, each GPU would need to gather the
+full [batch, seq, vocab_size] logits tensor before computing loss. With
+vocab=128K and seq=4K in BF16, that's 1GB per sample—loss parallel avoids this.
 
 ### Context Parallelism Constraints
 
@@ -359,8 +419,7 @@ The ×2 factor accounts for:
 | `n_heads` | `% tp == 0` | TP | Query heads split across TP ranks |
 | `n_kv_heads` | `% tp == 0` | TP | KV heads split across TP ranks |
 | `ffn_hidden_dim` | `% tp == 0` | TP | FFN layers split column/row-wise |
-| `vocab_size` | `% tp == 0` | TP + Loss Parallel | Output logits sharded for loss |
-| `dim` | `% tp == 0` | TP + Sequence Parallel | Embedding and norm sharding |
+| `vocab_size` | `% tp == 0` | TP | Embedding rows and output columns sharded |
 | `seq_len` | `% (tp × cp × 2) == 0` | CP | Ring attention load balancing |
 
 ### Practical Guidance
@@ -801,45 +860,167 @@ With `dp_shard=2, tp=2, pp=2` on 8 GPUs:
 Context Parallelism shards the **sequence dimension** across GPUs to enable
 training with very long contexts that wouldn't fit on a single device.
 
-### How CP Works
+### The Problem: Attention Memory Scales Quadratically
+
+Standard self-attention computes attention scores between all pairs of tokens:
 
 ```
-Context Parallel Sequence Sharding (cp=4, seq_len=8192):
+Attention(Q, K, V) = softmax(Q × K^T / √d) × V
 
-Original sequence: [token_0, token_1, ..., token_8191]
-                          │
-                          ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│ GPU 0: tokens [0:2048]        ─┐                                     │
-│ GPU 1: tokens [2048:4096]      │── Ring attention pattern           │
-│ GPU 2: tokens [4096:6144]      │   KV are rotated between ranks     │
-│ GPU 3: tokens [6144:8192]     ─┘                                     │
-└──────────────────────────────────────────────────────────────────────┘
+Memory for attention scores: O(seq_len²)
 ```
 
-### Ring Attention Pattern
+For a 32K sequence with batch=1 in BF16:
+- Attention scores: 32K × 32K × 2 bytes = **2 GB per layer per head**
+- With 32 heads: **64 GB just for attention scores**
 
-During attention computation, each GPU needs to attend to all tokens, but only
-holds a subset. CP uses a "ring" communication pattern:
+This quickly exceeds GPU memory. Context Parallelism solves this by splitting
+the sequence across GPUs, so each GPU only computes a portion of the attention.
+
+### The Key Insight: Ring Attention
+
+The insight behind ring attention is that attention can be computed
+**incrementally**. Instead of computing the full attention matrix at once,
+we can:
+
+1. Compute attention for a subset of K,V (producing partial scores)
+2. Combine partial results using the **online softmax** algorithm
+3. Repeat until all K,V have been processed
+
+This allows each GPU to hold only `seq_len/cp` tokens while still computing
+correct attention over the full sequence.
+
+### How Ring Attention Works
+
+Consider CP=4 with seq_len=8192 (2048 tokens per GPU):
 
 ```
-Ring Attention Communication (cp=4):
+Sequence Distribution:
 
-Step 1: Each GPU computes local Q×K^T for its own KV
-Step 2: Rotate KV shards around the ring
-Step 3: Each GPU computes Q×K^T for received KV
-Step 4: Repeat until all KV have been seen
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Original: [token_0, token_1, ..., token_8191]                           │
+│                                                                         │
+│ GPU 0: Q₀, K₀, V₀  (tokens 0-2047)                                     │
+│ GPU 1: Q₁, K₁, V₁  (tokens 2048-4095)                                  │
+│ GPU 2: Q₂, K₂, V₂  (tokens 4096-6143)                                  │
+│ GPU 3: Q₃, K₃, V₃  (tokens 6144-8191)                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
+Each GPU needs to compute attention between its queries (Qᵢ) and ALL keys/values
+(K₀...K₃, V₀...V₃). Ring attention achieves this through rotation:
+
+```
+Ring Attention Steps (cp=4):
+
+Step 0: Local computation
 ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐
-│ GPU0 │───►│ GPU1 │───►│ GPU2 │───►│ GPU3 │
-│ KV_0 │    │ KV_1 │    │ KV_2 │    │ KV_3 │
+│ GPU0 │    │ GPU1 │    │ GPU2 │    │ GPU3 │
+│Q₀×K₀ │    │Q₁×K₁ │    │Q₂×K₂ │    │Q₃×K₃ │
 └──────┘    └──────┘    └──────┘    └──────┘
-    ▲                                   │
-    └───────────────────────────────────┘
-              Ring rotation
+   Each GPU computes attention with its local KV
+
+Step 1: Rotate KV, compute with received KV
+┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐
+│ GPU0 │◄───│ GPU1 │◄───│ GPU2 │◄───│ GPU3 │◄──┐
+│Q₀×K₃ │    │Q₁×K₀ │    │Q₂×K₁ │    │Q₃×K₂ │   │
+└──────┘    └──────┘    └──────┘    └──────┘   │
+   │                                           │
+   └───────────────────────────────────────────┘
+   KV shards rotate around the ring
+
+Step 2: Rotate again
+┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐
+│ GPU0 │    │ GPU1 │    │ GPU2 │    │ GPU3 │
+│Q₀×K₂ │    │Q₁×K₃ │    │Q₂×K₀ │    │Q₃×K₁ │
+└──────┘    └──────┘    └──────┘    └──────┘
+
+Step 3: Final rotation
+┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐
+│ GPU0 │    │ GPU1 │    │ GPU2 │    │ GPU3 │
+│Q₀×K₁ │    │Q₁×K₂ │    │Q₂×K₃ │    │Q₃×K₀ │
+└──────┘    └──────┘    └──────┘    └──────┘
+
+After 4 steps, each GPU has computed Q×K for all K shards.
+Results are combined using online softmax.
 ```
 
-### CP Configuration
+### Online Softmax: Combining Partial Results
+
+The magic of ring attention is that we don't need to store all attention scores.
+We use **online softmax** to incrementally update the output:
+
+```
+Online Softmax Algorithm:
+
+For each incoming KV shard:
+1. Compute local attention scores: scores = Qᵢ × Kⱼᵀ / √d
+2. Find local max: m_new = max(m_old, max(scores))
+3. Rescale previous output: out = out × exp(m_old - m_new)
+4. Add new contribution: out += softmax(scores - m_new) × Vⱼ
+5. Update normalization: l = l × exp(m_old - m_new) + sum(exp(scores - m_new))
+
+Final: out = out / l
+```
+
+This produces mathematically identical results to standard attention while
+using O(seq_len/cp) memory per GPU instead of O(seq_len²).
+
+### Causal Masking and Load Balancing
+
+For causal (autoregressive) attention, token i can only attend to tokens 0..i.
+This creates a triangular attention pattern:
+
+```
+Causal Attention Matrix (seq=8, cp=2):
+
+        K₀ (GPU 0)    K₁ (GPU 1)
+       [0,1,2,3]      [4,5,6,7]
+      ┌─────────────┬─────────────┐
+Q₀  0 │  ■          │             │
+    1 │  ■ ■        │             │
+    2 │  ■ ■ ■      │             │
+    3 │  ■ ■ ■ ■    │             │
+      ├─────────────┼─────────────┤
+Q₁  4 │  ■ ■ ■ ■    │  ■          │
+    5 │  ■ ■ ■ ■    │  ■ ■        │
+    6 │  ■ ■ ■ ■    │  ■ ■ ■      │
+    7 │  ■ ■ ■ ■    │  ■ ■ ■ ■    │
+      └─────────────┴─────────────┘
+
+■ = valid attention (not masked)
+```
+
+**The Load Imbalance Problem**:
+- GPU 0 (Q₀): Only attends to K₀ (triangular, ~50% of block)
+- GPU 1 (Q₁): Attends to all of K₀ + triangular K₁ (~150% of one block)
+
+GPU 1 does 3× more work than GPU 0!
+
+**The Solution: Zigzag Splitting**
+
+To balance load, CP uses a zigzag pattern that interleaves tokens:
+
+```
+Zigzag Token Assignment (seq=8, cp=2):
+
+Instead of: GPU 0 = [0,1,2,3], GPU 1 = [4,5,6,7]
+
+Zigzag:     GPU 0 = [0,2,4,6], GPU 1 = [1,3,5,7]   (even/odd)
+
+Or more generally, split into 2×cp chunks and alternate:
+
+seq=16, cp=2:
+Chunk 0: [0,1,2,3]   → GPU 0
+Chunk 1: [4,5,6,7]   → GPU 1
+Chunk 2: [8,9,10,11] → GPU 1  (reversed assignment)
+Chunk 3: [12,13,14,15] → GPU 0
+```
+
+This is why the constraint is `seq_len % (cp × 2) == 0` — the factor of 2
+comes from this load-balancing zigzag pattern.
+
+### CP Configuration Options
 
 ```toml
 [parallelism]
@@ -847,12 +1028,66 @@ context_parallel_degree = 4
 context_parallel_rotate_method = "allgather"  # or "alltoall"
 ```
 
-**Rotation methods**:
-- `"allgather"`: All-gather all KV shards after first sub-SDPA (default)
-- `"alltoall"`: All-to-all shuffle KV shards for more balanced communication
+#### Rotation Methods
 
-### CP + TP + FSDP Mesh Topology Example
+**`allgather` (default)**:
+- After the first local attention, all-gather all KV shards
+- Each GPU then has full KV and computes remaining attention locally
+- **Pros**: Simple, fewer communication rounds
+- **Cons**: Higher peak memory (holds all KV briefly)
 
+```
+AllGather Method:
+
+Step 1: Local attention (Q₀×K₀ on GPU0, etc.)
+Step 2: All-gather KV → each GPU has [K₀,K₁,K₂,K₃]
+Step 3: Each GPU computes remaining attention locally
+```
+
+**`alltoall`**:
+- KV shards are shuffled via all-to-all communication each step
+- True ring rotation pattern
+- **Pros**: Lower peak memory, better for very high CP degrees
+- **Cons**: More communication rounds, higher latency
+
+```
+AllToAll Method:
+
+Repeat cp times:
+  1. Compute attention with current KV
+  2. All-to-all shuffle: send KV to next rank, receive from previous
+```
+
+**When to use which**:
+- `allgather`: CP ≤ 8, good intra-node bandwidth (NVLink)
+- `alltoall`: CP > 8, or memory-constrained scenarios
+
+### Memory and Communication Analysis
+
+**Memory per GPU**:
+
+| Component | Without CP | With CP (degree=4) |
+|-----------|-----------|-------------------|
+| Q, K, V tensors | O(seq × d) | O(seq/4 × d) |
+| Attention scores | O(seq²) | O(seq²/16) * |
+| Activations | O(seq × d) | O(seq/4 × d) |
+
+\* With FlashAttention, attention scores are not materialized, but the
+computational work is still reduced by cp² factor per GPU.
+
+**Communication volume**:
+- Each rotation step: 2 × (seq/cp) × n_kv_heads × head_dim × dtype_size
+- Total rotations: cp - 1 (or 1 for allgather)
+- Communication is overlapped with computation when possible
+
+**Example for 32K context, cp=4, hidden=4096, 8 KV heads, BF16**:
+- Per rotation: 2 × 8K × 8 × 128 × 2 bytes = 32 MB
+- Total (alltoall): 3 × 32 MB = 96 MB per layer
+- Total (allgather): 4 × 32 MB = 128 MB (one-time)
+
+### CP + TP + FSDP Mesh Topology
+
+When combining CP with other parallelisms, the mesh is organized hierarchically.
 With `dp_shard=2, tp=2, cp=2` on 8 GPUs:
 
 ```
@@ -894,15 +1129,61 @@ With `dp_shard=2, tp=2, cp=2` on 8 GPUs:
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Sequence Length Constraint
+**Communication patterns**:
+- **TP**: All-reduce within (G0,G1), (G2,G3), etc. — every layer
+- **CP**: Ring rotation within (G0,G2), (G1,G3), etc. — during attention only
+- **FSDP**: All-gather/reduce-scatter within (G0-G3), (G4-G7) — before/after layers
 
-CP requires sequence length to be divisible by `2 × cp_degree` (for load
-balancing):
+### Sequence Length Constraint Explained
+
+```
+Constraint: seq_len % (tp_degree × cp_degree × 2) == 0
+```
+
+This constraint comes from three requirements:
+
+1. **CP chunking**: seq_len must divide evenly by cp_degree
+2. **Load balancing**: The zigzag pattern requires 2× chunks (factor of 2)
+3. **TP integration**: When TP is enabled, sequence is also sharded for
+   Sequence Parallel, requiring divisibility by tp_degree
 
 ```python
+# From TorchTitan's parallel_dims.py
 seq_len_divisor = tp * (cp * 2)
-assert seq_len % seq_len_divisor == 0
+assert seq_len % seq_len_divisor == 0, \
+    f"seq_len ({seq_len}) must be divisible by {seq_len_divisor}"
 ```
+
+**Example calculations**:
+- seq_len=4096, tp=1, cp=4: 4096 % (1×4×2) = 4096 % 8 = 0 ✓
+- seq_len=32768, tp=2, cp=4: 32768 % (2×4×2) = 32768 % 16 = 0 ✓
+- seq_len=10000, tp=1, cp=4: 10000 % 8 = 0 ✓
+- seq_len=10000, tp=2, cp=4: 10000 % 16 = 0 ✗ (need 10000→9984 or 10000→10000)
+
+### When to Use Context Parallelism
+
+**Use CP when**:
+- Sequence length exceeds single-GPU memory (typically >8K-16K)
+- Training long-context models (32K, 64K, 128K+)
+- Fine-tuning for extended context capability
+
+**Don't use CP when**:
+- Sequence length fits in memory (adds unnecessary communication)
+- CP degree would exceed practical limits (communication overhead)
+- Model doesn't support SDPA attention (CP requires it)
+
+**Typical configurations**:
+
+| Sequence Length | Recommended CP | Chunk Size per GPU |
+|-----------------|----------------|-------------------|
+| 4K | 1 (disabled) | 4K |
+| 8K-16K | 2 | 4K-8K |
+| 32K | 4 | 8K |
+| 64K | 8 | 8K |
+| 128K | 8-16 | 8K-16K |
+
+**Rule of thumb**: Target 4K-8K tokens per GPU per CP chunk for optimal
+efficiency. Going below 2K increases communication overhead.
 
 ---
 
