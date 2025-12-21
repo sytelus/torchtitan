@@ -481,9 +481,301 @@ export NCCL_P2P_DISABLE=1
 
 ---
 
-## Part 8: Next Steps
+## Part 8: Evaluation with lm_eval
 
-Now that you've trained GPT-2 with TorchTitan, explore:
+After training your GPT-2 model, you'll want to evaluate it on standard benchmarks.
+This section shows how to use EleutherAI's `lm_eval` framework for comprehensive
+model evaluation.
+
+### 8.1 Understanding the Evaluation Pipeline
+
+The evaluation process involves three steps:
+
+1. **Enable HuggingFace checkpoint export** during training
+2. **Create a config.json** file for HuggingFace compatibility
+3. **Run lm_eval** with appropriate benchmarks
+
+```
+TorchTitan Checkpoint (DCP format)
+        ↓
+    convert_to_hf.py (uses GPT2StateDictAdapter)
+        ↓
+HuggingFace Checkpoint (safetensors)
+        ↓
+    lm_eval with vLLM or HF backend
+        ↓
+Benchmark Results (HellaSwag, LAMBADA, etc.)
+```
+
+### 8.2 Configure Training for Checkpoint Export
+
+Update your training config to save checkpoints in HuggingFace format:
+
+```toml
+[checkpoint]
+enable_checkpoint = true
+folder = "./outputs/gpt2_124m"
+interval = 1000  # Save every 1000 steps
+
+# Export to HuggingFace format on last save
+last_save_in_hf = true
+```
+
+Or pass via command line:
+
+```bash
+NGPU=1 CONFIG_FILE="./torchtitan/experiments/gpt2/train_configs/debug_model.toml" \
+    ./run_train.sh \
+    --checkpoint.enable_checkpoint \
+    --checkpoint.folder "./outputs/gpt2_debug" \
+    --checkpoint.interval 500 \
+    --checkpoint.last_save_in_hf
+```
+
+### 8.3 Create GPT-2 config.json
+
+The HuggingFace checkpoint requires a `config.json` file. Create one for your model:
+
+**For debugmodel (4M params):**
+
+```bash
+cat > ./outputs/gpt2_debug/config.json << 'EOF'
+{
+  "architectures": ["GPT2LMHeadModel"],
+  "model_type": "gpt2",
+  "vocab_size": 50257,
+  "n_positions": 1024,
+  "n_embd": 256,
+  "n_layer": 4,
+  "n_head": 4,
+  "activation_function": "gelu_new",
+  "resid_pdrop": 0.0,
+  "embd_pdrop": 0.0,
+  "attn_pdrop": 0.0,
+  "layer_norm_epsilon": 1e-5,
+  "bos_token_id": 50256,
+  "eos_token_id": 50256,
+  "tie_word_embeddings": true,
+  "torch_dtype": "float32"
+}
+EOF
+```
+
+**For GPT-2 124M:**
+
+```bash
+cat > ./outputs/gpt2_124m/config.json << 'EOF'
+{
+  "architectures": ["GPT2LMHeadModel"],
+  "model_type": "gpt2",
+  "vocab_size": 50257,
+  "n_positions": 1024,
+  "n_embd": 768,
+  "n_layer": 12,
+  "n_head": 12,
+  "activation_function": "gelu_new",
+  "resid_pdrop": 0.0,
+  "embd_pdrop": 0.0,
+  "attn_pdrop": 0.0,
+  "layer_norm_epsilon": 1e-5,
+  "bos_token_id": 50256,
+  "eos_token_id": 50256,
+  "tie_word_embeddings": true,
+  "torch_dtype": "bfloat16"
+}
+EOF
+```
+
+### 8.4 Manual Checkpoint Conversion (Optional)
+
+If you didn't use `last_save_in_hf`, you can convert checkpoints manually:
+
+```bash
+python scripts/checkpoint_conversion/convert_to_hf.py \
+    --model gpt2 \
+    --flavor 124M \
+    --checkpoint_path ./outputs/gpt2_124m/step-20000 \
+    --output_path ./outputs/gpt2_124m_hf
+```
+
+Then copy the config.json and tokenizer files:
+
+```bash
+cp ./outputs/gpt2_124m/config.json ./outputs/gpt2_124m_hf/
+cp ./assets/hf/gpt2/tokenizer.json ./outputs/gpt2_124m_hf/
+cp ./assets/hf/gpt2/tokenizer_config.json ./outputs/gpt2_124m_hf/
+```
+
+### 8.5 Set Up lm_eval Environment
+
+**Important**: Installing `lm-eval` may break your TorchTitan environment due to
+dependency conflicts. Create a separate environment:
+
+```bash
+# Create new environment for evaluation
+conda create -n lm_eval python=3.11 -y
+conda activate lm_eval
+
+# Install lm-eval with vLLM backend (recommended for speed)
+pip install "lm-eval[vllm]"
+
+# Or install with HuggingFace backend only (simpler, slower)
+pip install lm-eval
+```
+
+### 8.6 Run Evaluation Benchmarks
+
+#### Recommended Benchmarks for GPT-2
+
+For GPT-2 scale models, these benchmarks are most informative:
+
+| Benchmark | Description | Metric | Shots |
+|-----------|-------------|--------|-------|
+| hellaswag | Commonsense reasoning | acc_norm | 0 |
+| lambada_openai | Language modeling | acc | 0 |
+| winogrande | Coreference resolution | acc | 0 |
+| piqa | Physical intuition | acc | 0 |
+| arc_easy | Science questions (easy) | acc | 0 |
+| boolq | Boolean questions | acc | 0 |
+
+#### Option A: Using vLLM Backend (Fast, GPU)
+
+```bash
+# Activate the lm_eval environment
+conda activate lm_eval
+
+# Run evaluation with vLLM (single GPU)
+lm_eval --model vllm \
+    --model_args pretrained=./outputs/gpt2_124m_hf,dtype=auto,gpu_memory_utilization=0.8 \
+    --tasks hellaswag,lambada_openai,winogrande,piqa,arc_easy,boolq \
+    --batch_size auto \
+    --output_path ./outputs/gpt2_124m_eval
+
+# For multi-GPU evaluation (8 GPUs)
+lm_eval --model vllm \
+    --model_args pretrained=./outputs/gpt2_124m_hf,tensor_parallel_size=8,dtype=auto,gpu_memory_utilization=0.8 \
+    --tasks hellaswag,lambada_openai,winogrande,piqa,arc_easy,boolq \
+    --batch_size auto \
+    --output_path ./outputs/gpt2_124m_eval
+```
+
+#### Option B: Using HuggingFace Backend (Simpler, Slower)
+
+```bash
+conda activate lm_eval
+
+# Run evaluation with HuggingFace transformers
+lm_eval --model hf \
+    --model_args pretrained=./outputs/gpt2_124m_hf \
+    --tasks hellaswag,lambada_openai,winogrande,piqa,arc_easy,boolq \
+    --batch_size 16 \
+    --device cuda:0 \
+    --output_path ./outputs/gpt2_124m_eval
+```
+
+### 8.7 Expected Results
+
+For a well-trained GPT-2 124M model (~10B tokens on OpenWebText), expect results
+similar to:
+
+| Task | Metric | Expected Score |
+|------|--------|----------------|
+| hellaswag | acc_norm | 0.31 - 0.33 |
+| lambada_openai | acc | 0.45 - 0.50 |
+| winogrande | acc | 0.52 - 0.55 |
+| piqa | acc | 0.65 - 0.70 |
+| arc_easy | acc | 0.45 - 0.50 |
+| boolq | acc | 0.60 - 0.65 |
+
+**Note**: These are approximate values. Actual results depend on:
+- Training data quality and quantity
+- Training hyperparameters
+- Random seed
+- Number of training steps
+
+A debug model trained on Shakespeare will score lower (near random baseline) on
+these benchmarks since it was trained on a very small, domain-specific dataset.
+
+### 8.8 Interpreting Results
+
+**HellaSwag** (acc_norm ~0.32): Tests commonsense reasoning. GPT-2 124M is near
+random baseline (0.25) but shows some learning.
+
+**LAMBADA** (acc ~0.47): Tests long-range language modeling. Higher scores indicate
+better context understanding.
+
+**WinoGrande** (acc ~0.53): Tests coreference. Scores near 0.50 indicate near-random
+performance (binary choice task).
+
+**PIQA** (acc ~0.68): Tests physical intuition. GPT-2 124M typically performs well
+here, above the 0.50 random baseline.
+
+### 8.9 Running Periodic Evaluations
+
+For longer training runs, you may want to evaluate at multiple checkpoints:
+
+```bash
+#!/bin/bash
+# evaluate_checkpoints.sh
+
+CHECKPOINT_DIR="./outputs/gpt2_124m"
+OUTPUT_DIR="./outputs/gpt2_124m_eval"
+CONFIG_JSON="./outputs/gpt2_124m/config.json"
+TOKENIZER_DIR="./assets/hf/gpt2"
+
+for step in 5000 10000 15000 20000; do
+    STEP_DIR="${CHECKPOINT_DIR}/step-${step}"
+    if [ -d "$STEP_DIR" ]; then
+        echo "Evaluating step $step..."
+
+        # Prepare HF checkpoint
+        HF_DIR="${OUTPUT_DIR}/step-${step}"
+        mkdir -p "$HF_DIR"
+
+        # Convert if needed (or use existing HF export)
+        python scripts/checkpoint_conversion/convert_to_hf.py \
+            --model gpt2 \
+            --flavor 124M \
+            --checkpoint_path "$STEP_DIR" \
+            --output_path "$HF_DIR"
+
+        # Copy config and tokenizer
+        cp "$CONFIG_JSON" "$HF_DIR/"
+        cp "${TOKENIZER_DIR}/tokenizer.json" "$HF_DIR/"
+        cp "${TOKENIZER_DIR}/tokenizer_config.json" "$HF_DIR/"
+
+        # Run evaluation
+        lm_eval --model vllm \
+            --model_args pretrained="$HF_DIR",dtype=auto \
+            --tasks hellaswag,lambada_openai \
+            --batch_size auto \
+            --output_path "${OUTPUT_DIR}/results-step-${step}"
+    fi
+done
+```
+
+### 8.10 Quick Smoke Test
+
+For a quick sanity check, run a single fast benchmark:
+
+```bash
+# Quick test with LAMBADA (fast, ~14K examples)
+lm_eval --model hf \
+    --model_args pretrained=./outputs/gpt2_debug_hf \
+    --tasks lambada_openai \
+    --limit 100 \
+    --batch_size 8 \
+    --device cuda:0
+```
+
+This runs on just 100 examples and completes in seconds, useful for verifying
+your checkpoint conversion worked correctly.
+
+---
+
+## Part 9: Next Steps
+
+Now that you've trained and evaluated GPT-2 with TorchTitan, explore:
 
 1. **Tensor Parallelism**: See `torchtitan/models/llama3/infra/parallelize.py`
    for TP implementation
@@ -500,6 +792,9 @@ Now that you've trained GPT-2 with TorchTitan, explore:
 
 5. **Custom Models**: Use the GPT-2 experiment as a template for your own models
 
+6. **In-Training Validation**: Use the `Validator` class for validation during
+   training (see `docs/evaluation.md`)
+
 ---
 
 ## Summary
@@ -512,6 +807,8 @@ In this tutorial, you learned:
 - ✅ How to visualize training with WandB
 - ✅ How to scale to 8 GPUs with DDP
 - ✅ How to add custom datasets
+- ✅ How to evaluate models using lm_eval benchmarks
+- ✅ How to convert checkpoints for HuggingFace compatibility
 
 TorchTitan provides a clean, modular framework for distributed LLM training.
 The patterns you learned here apply to any model architecture!

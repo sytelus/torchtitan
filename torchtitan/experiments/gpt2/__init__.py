@@ -29,11 +29,13 @@ from torchtitan.protocols.train_spec import TrainSpec
 from .infra.parallelize import parallelize_gpt2
 from .model.args import GPT2ModelArgs
 from .model.model import GPT2Model
+from .model.state_dict_adapter import GPT2StateDictAdapter
 
 __all__ = [
     "parallelize_gpt2",
     "GPT2ModelArgs",
     "GPT2Model",
+    "GPT2StateDictAdapter",
     "gpt2_configs",
 ]
 
@@ -95,4 +97,5 @@ def get_train_spec() -> TrainSpec:
         build_dataloader_fn=build_text_dataloader,
         build_tokenizer_fn=build_hf_tokenizer,
         build_loss_fn=build_cross_entropy_loss,
+        state_dict_adapter=GPT2StateDictAdapter,
     )
