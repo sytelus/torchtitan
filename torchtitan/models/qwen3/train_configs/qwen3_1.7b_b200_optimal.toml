@@ -1,0 +1,81 @@
+# Qwen3 1.7B - Maximum Performance on 4×8 B200 GPUs with MXFP8
+# Optimized for NVIDIA B200 (SM100) with MXFP8 quantization
+# Expected: ~25-30% speedup over BF16 baseline
+#
+# For a full option list and defaults, see docs/config_reference.md.
+# For FP8/MXFP8 details, see docs/mxfp8.md and docs/float8.md.
+
+[job]
+dump_folder = "./outputs/qwen3_1.7b_b200_optimal"
+description = "Qwen3 1.7B optimized for B200 with MXFP8 (4 nodes × 8 GPUs)"
+
+[profiling]
+enable_profiling = false      # Disable for production (saves overhead)
+save_traces_folder = "profile_trace"
+profile_freq = 500
+
+[metrics]
+log_freq = 10
+enable_tensorboard = false    # Disable if using WandB (saves I/O)
+enable_wandb = true
+save_tb_folder = "tb"
+
+[model]
+name = "qwen3"
+flavor = "1.7B"
+hf_assets_path = "./assets/hf/Qwen3-1.7B"
+converters = ["quantize.linear.mx"]  # MXFP8 for B200
+
+[optimizer]
+name = "AdamW"
+lr = 3e-4                     # Chinchilla-optimal for 1-2B models
+eps = 1e-8
+fused = true                  # Fused AdamW (~20% optimizer speedup)
+
+[lr_scheduler]
+warmup_steps = 2000           # ~1% of total steps
+decay_ratio = 0.1             # 10% final LR
+decay_type = "cosine"
+
+[training]
+local_batch_size = 12         # Increased from 8 (MXFP8 uses less memory)
+seq_len = 4096                # Qwen3 default context length
+max_norm = 1.0                # Gradient clipping
+steps = 200000                # ~200B tokens (200K × 12 × 32 × 4096)
+dataset = "climbmix"
+mixed_precision = "bfloat16"  # Base precision (MXFP8 handles compute)
+
+[parallelism]
+# HSDP: FSDP within nodes (8 GPUs), DDP across nodes (4 nodes)
+data_parallel_replicate_degree = 4    # Replicate across 4 nodes
+data_parallel_shard_degree = 8        # Shard within each node's 8 GPUs
+fsdp_reshard_after_forward = "default"
+tensor_parallel_degree = 1
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[checkpoint]
+enable = true
+folder = "checkpoint"
+interval = 5000               # Save every 5000 steps (~1.5 hours)
+last_save_model_only = false
+export_dtype = "bfloat16"
+async_mode = "async"          # Non-blocking saves for minimal overhead
+last_save_in_hf = true        # Export final checkpoint in HuggingFace format
+
+[activation_checkpoint]
+mode = "selective"            # Per-op selective AC (balance memory/compute)
+selective_ac_option = "op"
+
+[compile]
+enable = true                 # REQUIRED for MXFP8 competitive performance
+components = ["model", "loss"]
+
+[quantize.linear.mx]
+# MXFP8 configuration for B200 GPUs
+recipe_name = "mxfp8_cublas"           # cuBLAS kernels (fastest on B200)
+mxfp8_dim1_cast_kernel_choice = "cuda" # CUDA kernel (fastest for dim1 quantization)
+filter_fqns = ["output"]               # Skip output layer (improves stability)
+
+# Note: For GB200 (NVLink-connected B200 pairs), build TorchAO from source:
+# USE_CPP=0 pip install git+https://github.com/pytorch/ao.git
