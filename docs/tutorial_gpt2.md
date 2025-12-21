@@ -10,6 +10,7 @@ Qwen3. You'll learn:
 4. How to scale to 8 B200 GPUs using DDP (Distributed Data Parallel)
 5. How to evaluate trained models using lm_eval benchmarks
 6. How to pretrain Qwen3 1.7B on 4 nodes (32 GPUs) with HSDP and ClimbMix dataset
+7. How to fine-tune for long context (32k) using Context Parallelism
 
 ---
 
@@ -2111,6 +2112,293 @@ USE_CPP=0 pip install git+https://github.com/pytorch/ao.git
 --model.converters="quantize.linear.mx" \
 --quantize.linear.mx.recipe_name="mxfp8_cublas" \
 --compile.enable
+```
+
+---
+
+### 9.14 Long Context Fine-tuning with Context Parallelism
+
+After pretraining Qwen3 1.7B on standard 4k context, you can extend its context window
+through fine-tuning on long-context data. This section covers fine-tuning on the
+[Dolma3 LongMino Mix](https://huggingface.co/datasets/allenai/dolma3_longmino_mix-50B-1025)
+dataset with 32k sequence length using **Context Parallelism (CP)**.
+
+#### What is Context Parallelism?
+
+Context Parallelism splits long sequences across multiple GPUs, allowing training with
+sequence lengths that would otherwise exceed GPU memory:
+
+```
+                    Standard Training (4k context)
+┌──────────────────────────────────────────────────────┐
+│ GPU 0: Full sequence (4096 tokens)                   │
+└──────────────────────────────────────────────────────┘
+
+              Context Parallelism (32k context, CP=4)
+┌─────────────────┬─────────────────┬─────────────────┬─────────────────┐
+│ GPU 0: 8k tokens│ GPU 1: 8k tokens│ GPU 2: 8k tokens│ GPU 3: 8k tokens│
+└─────────────────┴─────────────────┴─────────────────┴─────────────────┘
+        ↑                 ↑                 ↑                 ↑
+        └─────────────────┴─────────────────┴─────────────────┘
+                    Ring attention for KV exchange
+```
+
+CP uses a **ring attention** pattern where each GPU processes its chunk and exchanges
+KV cache with neighboring GPUs, enabling attention across the full sequence.
+
+#### Dataset: Dolma3 LongMino Mix
+
+The Dolma3 LongMino Mix dataset provides 50B tokens of long-context training data:
+
+| Property | Value |
+|----------|-------|
+| Total Tokens | ~50B |
+| Content | Long documents suitable for extended context |
+| Text Field | `text` |
+| Source | [allenai/dolma3_longmino_mix-50B-1025](https://huggingface.co/datasets/allenai/dolma3_longmino_mix-50B-1025) |
+
+#### Hardware Requirements and Node Estimation
+
+For 32k sequence length with optimal performance:
+
+**Constraint**: `seq_len % (tp × cp × 2) == 0`
+- 32768 % (1 × 4 × 2) = 0 ✓ (CP=4 works)
+- 32768 % (1 × 8 × 2) = 0 ✓ (CP=8 works)
+
+**Parallelism options (8 B200 GPUs per node)**:
+
+| Nodes | GPUs | CP | FSDP Shard | Config | Chunk Size |
+|-------|------|----|-----------:|--------|------------|
+| 1 | 8 | 4 | 2 | Minimal | 8k tokens |
+| 2 | 16 | 4 | 4 | Recommended | 8k tokens |
+| 4 | 32 | 4 | 8 | High throughput | 8k tokens |
+| 4 | 32 | 8 | 4 | Maximum context | 4k tokens |
+
+**Recommended: 2 nodes (16 GPUs)** with CP=4 and FSDP shard=4
+
+This configuration balances:
+- Memory efficiency (8k chunks fit comfortably in B200 HBM)
+- Training throughput (~50B tokens in ~190k steps)
+- Communication overhead (CP=4 is optimal for most workloads)
+
+#### Step 1: Download Qwen3 Tokenizer
+
+```bash
+# Download tokenizer only (not model weights)
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='Qwen/Qwen3-1.7B',
+    allow_patterns=['tokenizer*', 'vocab*', 'merges*', '*.json'],
+    local_dir='./assets/hf/Qwen3-1.7B'
+)
+print('Tokenizer downloaded to ./assets/hf/Qwen3-1.7B')
+"
+```
+
+#### Step 2: Install TorchAO for MXFP8 (B200)
+
+```bash
+# For B200 GPUs (standard installation)
+pip install torchao
+
+# For GB200 (NVLink-connected B200 pairs) - build from source
+USE_CPP=0 pip install git+https://github.com/pytorch/ao.git
+```
+
+#### Step 3: Configure Long Context Training
+
+Create the config file (already available at
+`torchtitan/models/qwen3/train_configs/qwen3_1.7b_longcontext_cp.toml`):
+
+```toml
+[job]
+dump_folder = "./outputs/qwen3_1.7b_longcontext"
+description = "Qwen3 1.7B long context fine-tuning (2 nodes × 8 B200 GPUs)"
+
+[model]
+name = "qwen3"
+flavor = "1.7B"
+hf_assets_path = "./assets/hf/Qwen3-1.7B"
+converters = ["quantize.linear.mx"]  # MXFP8 for B200
+
+[optimizer]
+name = "AdamW"
+lr = 1e-4                     # Lower LR for fine-tuning
+eps = 1e-8
+fused = true
+
+[lr_scheduler]
+warmup_steps = 1000           # Shorter warmup for fine-tuning
+decay_ratio = 0.1
+decay_type = "cosine"
+
+[training]
+local_batch_size = 2          # Reduced for 32k context
+seq_len = 32768               # 32k context length
+max_norm = 1.0
+steps = 190000                # ~50B tokens
+dataset = "dolma3_longmino"
+mixed_precision = "bfloat16"
+
+[parallelism]
+data_parallel_replicate_degree = 1    # Pure FSDP (no DDP)
+data_parallel_shard_degree = 4        # FSDP within CP group
+context_parallel_degree = 4           # Split 32k into 4×8k
+context_parallel_rotate_method = "allgather"
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[activation_checkpoint]
+mode = "selective"            # Critical for long context memory
+selective_ac_option = "op"
+
+[compile]
+enable = true                 # Required for CP + MXFP8 performance
+
+[quantize.linear.mx]
+recipe_name = "mxfp8_cublas"
+mxfp8_dim1_cast_kernel_choice = "cuda"
+filter_fqns = ["output"]
+```
+
+#### Step 4: Launch Training
+
+**Single node (8 GPUs) - for testing**:
+```bash
+# Adjust config for single node: CP=4, dp_shard=2
+CONFIG_FILE="./torchtitan/models/qwen3/train_configs/qwen3_1.7b_longcontext_cp.toml" \
+NGPU=8 ./run_train.sh \
+    --parallelism.data_parallel_shard_degree=2
+```
+
+**Two nodes (16 GPUs) - recommended**:
+```bash
+# On each node (adjust MASTER_ADDR and NODE_RANK)
+export MASTER_ADDR=<head-node-ip>
+export MASTER_PORT=29500
+export NNODES=2
+export NODE_RANK=<0-or-1>
+
+CONFIG_FILE="./torchtitan/models/qwen3/train_configs/qwen3_1.7b_longcontext_cp.toml" \
+torchrun --nproc_per_node=8 --nnodes=$NNODES --node_rank=$NODE_RANK \
+    --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+    -m torchtitan.train --job.config_file=$CONFIG_FILE
+```
+
+**SLURM cluster (2 nodes)**:
+```bash
+#!/bin/bash
+#SBATCH --job-name=qwen3-longcontext
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=8
+#SBATCH --time=72:00:00
+#SBATCH --partition=gpu
+
+srun torchrun --nproc_per_node=8 --nnodes=2 \
+    --rdzv_id=$SLURM_JOB_ID --rdzv_backend=c10d \
+    --rdzv_endpoint=$(scontrol show hostname $SLURM_NODELIST | head -n1):29500 \
+    -m torchtitan.train \
+    --job.config_file=./torchtitan/models/qwen3/train_configs/qwen3_1.7b_longcontext_cp.toml
+```
+
+#### Configuration Decisions Explained
+
+| Config | Value | Rationale |
+|--------|-------|-----------|
+| **lr = 1e-4** | 3× lower than pretraining | Fine-tuning requires smaller updates to preserve pretrained knowledge |
+| **warmup_steps = 1000** | 0.5% of total | Shorter warmup since model is already trained |
+| **local_batch_size = 2** | Reduced from 12 | 32k context uses 8× more memory than 4k; MXFP8 helps but batch must shrink |
+| **seq_len = 32768** | 32k | Target long-context capability; divisible by CP×2 |
+| **context_parallel_degree = 4** | CP=4 | Splits 32k into 8k chunks; good balance of memory and communication |
+| **data_parallel_shard_degree = 4** | FSDP=4 | Shards model across 4 GPUs within each CP group |
+| **context_parallel_rotate_method = "allgather"** | Default | Standard ring attention; use "alltoall" for higher CP degrees |
+| **activation_checkpoint = "selective"** | Op-level AC | Essential for long context; full AC would be too slow |
+| **compile.enable = true** | Required | Fuses attention and MXFP8 ops for 2-3× speedup |
+
+#### Memory and Throughput Analysis
+
+**Memory per GPU (B200 with 192GB HBM)**:
+
+| Component | 4k Context | 32k Context (no CP) | 32k Context (CP=4) |
+|-----------|-----------|---------------------|-------------------|
+| Model (BF16) | ~3.4 GB | ~3.4 GB | ~3.4 GB |
+| Model (MXFP8) | ~1.7 GB | ~1.7 GB | ~1.7 GB |
+| Activations | ~8 GB | ~64 GB (OOM!) | ~16 GB |
+| KV Cache | ~2 GB | ~16 GB | ~4 GB |
+| Optimizer | ~7 GB | ~7 GB | ~7 GB |
+| **Total** | ~22 GB | OOM | ~30 GB ✓ |
+
+**Throughput estimate (2 nodes, 16 B200 GPUs)**:
+- Tokens per step: `batch_size × dp_degree × seq_len = 2 × 4 × 32768 = 262k`
+- Steps for 50B tokens: `50B / 262k ≈ 190,000 steps`
+- Estimated time per step: ~2-3 seconds
+- Total training time: ~5-7 days
+
+#### Scaling to Higher Context
+
+For even longer contexts (64k, 128k), increase CP accordingly:
+
+```bash
+# 64k context (4 nodes, 32 GPUs)
+--training.seq_len=65536 \
+--parallelism.context_parallel_degree=8 \
+--parallelism.data_parallel_shard_degree=4 \
+--training.local_batch_size=1
+
+# 128k context (8 nodes, 64 GPUs)
+--training.seq_len=131072 \
+--parallelism.context_parallel_degree=16 \
+--parallelism.data_parallel_shard_degree=4 \
+--training.local_batch_size=1
+```
+
+#### Combining CP with HSDP
+
+For larger clusters, combine Context Parallelism with HSDP:
+
+```toml
+[parallelism]
+# 4 nodes × 8 GPUs = 32 GPUs
+# Layout: 2 HSDP groups × (CP=4 × FSDP=4)
+data_parallel_replicate_degree = 2    # HSDP replication across node pairs
+data_parallel_shard_degree = 4        # FSDP within CP group
+context_parallel_degree = 4           # Split sequences
+```
+
+This gives: `2 (replicate) × 4 (shard) × 4 (CP) = 32 GPUs`
+
+#### Troubleshooting
+
+**OOM errors**:
+```bash
+# Reduce batch size further
+--training.local_batch_size=1
+
+# Enable full activation checkpointing
+--activation_checkpoint.mode="full"
+
+# Increase CP degree
+--parallelism.context_parallel_degree=8
+```
+
+**Slow training**:
+```bash
+# Ensure compile is enabled
+--compile.enable
+
+# Try alltoall rotation for higher CP
+--parallelism.context_parallel_rotate_method="alltoall"
+```
+
+**NaN loss**:
+```bash
+# Use smaller learning rate
+--optimizer.lr=5e-5
+
+# Add more warmup
+--lr_scheduler.warmup_steps=2000
 ```
 
 ---

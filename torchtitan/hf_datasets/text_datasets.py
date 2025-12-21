@@ -68,6 +68,20 @@ def _process_climbmix_text(sample: dict[str, Any]) -> str:
     return sample["text"]
 
 
+def _load_dolma3_longmino_dataset(dataset_path: str):
+    """Load Dolma3 LongMino Mix dataset (allenai/dolma3_longmino_mix-50B-1025).
+
+    Dolma3 LongMino Mix is a long-context dataset with 50B tokens.
+    Contains documents with extended context suitable for training long-context models.
+    """
+    return load_dataset(dataset_path, split="train", streaming=True)
+
+
+def _process_dolma3_longmino_text(sample: dict[str, Any]) -> str:
+    """Process Dolma3 LongMino dataset sample text."""
+    return sample["text"]
+
+
 # Add your dataset here - more information at docs/datasets.md
 DATASETS = {
     "c4": DatasetConfig(
@@ -106,6 +120,13 @@ DATASETS = {
         path="OptimalScale/ClimbMix",
         loader=_load_climbmix_dataset,
         sample_processor=_process_climbmix_text,
+    ),
+    # Dolma3 LongMino Mix dataset (from allenai/dolma3_longmino_mix-50B-1025)
+    # Long-context dataset with 50B tokens for training extended context models
+    "dolma3_longmino": DatasetConfig(
+        path="allenai/dolma3_longmino_mix-50B-1025",
+        loader=_load_dolma3_longmino_dataset,
+        sample_processor=_process_dolma3_longmino_text,
     ),
 }
 

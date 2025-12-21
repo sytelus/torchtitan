@@ -1,0 +1,85 @@
+# Qwen3 1.7B Long Context Fine-tuning with Context Parallelism
+# Optimized for 2 nodes × 8 B200 GPUs (16 GPUs total)
+# 32k sequence length with CP=4 and FSDP, MXFP8 quantization
+#
+# For a full option list and defaults, see docs/config_reference.md.
+# For context parallelism details, see docs/parallelism_primer.md.
+
+[job]
+dump_folder = "./outputs/qwen3_1.7b_longcontext"
+description = "Qwen3 1.7B long context fine-tuning on Dolma3 LongMino (2 nodes × 8 B200 GPUs)"
+
+[profiling]
+enable_profiling = false      # Disable for production runs
+save_traces_folder = "profile_trace"
+profile_freq = 500
+
+[metrics]
+log_freq = 10
+enable_tensorboard = false    # Disable if using WandB
+enable_wandb = true
+save_tb_folder = "tb"
+
+[model]
+name = "qwen3"
+flavor = "1.7B"
+hf_assets_path = "./assets/hf/Qwen3-1.7B"
+converters = ["quantize.linear.mx"]  # MXFP8 for B200 (memory efficient for long context)
+
+[optimizer]
+name = "AdamW"
+lr = 1e-4                     # Lower LR for fine-tuning (vs 3e-4 for pretraining)
+eps = 1e-8
+fused = true                  # Fused AdamW for performance
+
+[lr_scheduler]
+warmup_steps = 1000           # Shorter warmup for fine-tuning
+decay_ratio = 0.1             # 10% final LR
+decay_type = "cosine"
+
+[training]
+local_batch_size = 2          # Reduced due to 32k context (memory intensive)
+seq_len = 32768               # 32k context length for long-context training
+max_norm = 1.0                # Gradient clipping (important for long sequences)
+steps = 190000                # ~50B tokens (190K × 8 × 32768 ≈ 50B)
+dataset = "dolma3_longmino"
+mixed_precision = "bfloat16"  # Base precision (MXFP8 handles matmul compute)
+
+[parallelism]
+# Context Parallelism + FSDP for long sequences
+# CP=4 splits 32k sequences into 4×8k chunks (one per CP rank)
+# FSDP shards model across 4 GPUs within each CP group
+# Total: 4 (CP) × 4 (FSDP) = 16 GPUs = 2 nodes
+data_parallel_replicate_degree = 1    # No DDP replication (pure FSDP)
+data_parallel_shard_degree = 4        # FSDP sharding within CP group
+context_parallel_degree = 4           # Split 32k into 4×8k chunks
+context_parallel_rotate_method = "allgather"  # Default rotation method
+fsdp_reshard_after_forward = "default"
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[checkpoint]
+enable = true
+folder = "checkpoint"
+interval = 5000               # Save every 5000 steps
+last_save_model_only = false
+export_dtype = "bfloat16"
+async_mode = "async"          # Non-blocking saves
+last_save_in_hf = true        # Export final checkpoint in HuggingFace format
+
+[activation_checkpoint]
+mode = "selective"            # Balance memory/compute (critical for long context)
+selective_ac_option = "op"
+
+[compile]
+enable = true                 # REQUIRED for MXFP8 and CP performance
+components = ["model", "loss"]
+
+[quantize.linear.mx]
+# MXFP8 configuration for B200 GPUs
+recipe_name = "mxfp8_cublas"           # cuBLAS kernels (fastest on B200)
+mxfp8_dim1_cast_kernel_choice = "cuda" # CUDA kernel for dim1 quantization
+filter_fqns = ["output"]               # Skip output layer for stability
+
+# Note: For GB200 (NVLink-connected B200 pairs), build TorchAO from source:
+# USE_CPP=0 pip install git+https://github.com/pytorch/ao.git
