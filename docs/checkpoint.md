@@ -2,6 +2,223 @@
 
 You may want to enable checkpointing in `torchtitan` for better fault tolerance during training, or to enable easier importing and exporting of weights between `torchtitan` and other libraries. `torchtitan` offers varying degrees of support for other checkpoint formats which are listed further below.
 
+## Checkpoint Formats
+
+TorchTitan supports three checkpoint formats, each suited for different use cases:
+
+### DCP (Distributed Checkpoint) - Default
+
+PyTorch's native distributed checkpoint format. Each rank saves its shard independently.
+
+**File structure:**
+```
+{dump_folder}/{checkpoint.folder}/
+├── step-1000/
+│   ├── __0_0.distcp    # Rank 0 shard
+│   ├── __0_1.distcp    # Rank 1 shard
+│   └── .metadata       # Distributed metadata
+└── step-2000/
+```
+
+**What's saved:**
+| Key | Contents | Purpose |
+|-----|----------|---------|
+| `model` | Model parameters (DTensor-aware) | Resume training, inference |
+| `optimizer` | Optimizer states (momentum, variance) | Resume training exactly |
+| `lr_scheduler` | LR schedule position | Continue schedule |
+| `dataloader` | Iterator position | Avoid repeating data |
+| `train_state` | Step count, tokens seen | Training progress |
+
+**When to use:** Training with resumption, distributed training, optimizer state preservation.
+
+### HuggingFace Safetensors
+
+Modern HuggingFace format for safe, fast loading. Compatible with HuggingFace ecosystem.
+
+**File structure:**
+```
+{checkpoint_id}/
+├── model.safetensors              # Single file OR
+├── model-00001-of-00004.safetensors
+├── model-00002-of-00004.safetensors
+├── ...
+└── model.safetensors.index.json   # FQN to file mapping
+```
+
+**Important:** Only saves model weights (no optimizer/scheduler state).
+
+**When to use:** Sharing models with HuggingFace ecosystem, inference with `transformers` library.
+
+### PyTorch Native (.pt)
+
+Standard PyTorch format, single file.
+
+**When to use:** Simple inference, non-distributed use, compatibility with standard PyTorch tools.
+
+### Format Comparison
+
+| Format | Distributed Save | All State | Ecosystem | Best For |
+|--------|-----------------|-----------|-----------|----------|
+| DCP | Yes | Yes | TorchTitan | Training resumption |
+| Safetensors | Consolidated | Model only | HuggingFace | Inference, sharing |
+| .pt | Consolidated | Model only | PyTorch | Simple workflows |
+
+---
+
+## Resuming Training After Pre-emption
+
+TorchTitan's checkpoint system enables seamless resumption after crashes or pre-emption.
+
+### What Gets Restored
+
+When loading a checkpoint, TorchTitan restores:
+1. **Model parameters** - Exact weights from checkpoint
+2. **Optimizer state** - Momentum, variance (for Adam/AdamW)
+3. **LR scheduler** - Position in warmup/decay schedule
+4. **Dataloader position** - Exact sample index (no data repetition)
+5. **Training step** - Continue from correct step number
+
+### How to Resume
+
+**Automatic (latest checkpoint):**
+```bash
+# Just run training again - it automatically loads latest checkpoint
+./run_train.sh --checkpoint.enable
+```
+
+**Specific step:**
+```bash
+./run_train.sh --checkpoint.enable --checkpoint.load_step 10000
+```
+
+**From different path (e.g., pre-trained model):**
+```bash
+./run_train.sh --checkpoint.enable \
+    --checkpoint.initial_load_path /path/to/pretrained \
+    --checkpoint.initial_load_model_only true
+```
+
+### Checkpoint Discovery
+
+TorchTitan automatically finds checkpoints:
+1. Scans `{dump_folder}/{checkpoint.folder}/` for `step-*` directories
+2. Validates each by checking for `.metadata` (DCP) or `model.safetensors.index.json` (HF)
+3. Returns the maximum step found (or specific step if `load_step` is set)
+
+### Partial Loading
+
+Skip specific components when resuming:
+```toml
+[checkpoint]
+enable = true
+exclude_from_loading = ["dataloader", "lr_scheduler"]
+```
+
+Use cases:
+- Change learning rate schedule mid-training
+- Resume with different batch size (skip dataloader state)
+- Fine-tune from pre-trained (load model only)
+
+### Fault Tolerance with TorchFT
+
+For elastic training with node failures, TorchTitan integrates with TorchFT:
+
+```toml
+[fault_tolerance]
+enable = true
+min_replica_size = 1    # Continue with at least 1 replica
+
+[checkpoint]
+enable = true
+enable_ft_dataloader_checkpoints = true  # Per-replica dataloader state
+```
+
+TorchFT provides:
+- **Dual checkpointing**: Full checkpoint + per-replica dataloader state
+- **Elastic recovery**: Surviving replicas continue; failed replicas rejoin
+- **Semi-synchronous training**: DiLoCo or LocalSGD for async gradient updates
+
+---
+
+## Async Checkpointing
+
+Standard synchronous checkpointing blocks training while saving, which can take
+minutes for large models. TorchTitan offers three async modes to reduce this
+overhead.
+
+### The Three Modes
+
+| Mode | How it Works | Blocking Time | Memory Cost |
+|------|--------------|---------------|-------------|
+| `disabled` | Synchronous save | High (minutes for large models) | None |
+| `async` | Background threads via `dcp.async_save` | Low (tens of seconds) | GPU memory for staging |
+| `async_with_pinned_mem` | Separate process + pinned CPU memory | Near-zero (<1s) | High CPU memory |
+
+### Why `disabled` is the Default
+
+The conservative default ensures safety across all environments:
+
+1. **CPU Memory Safety**: The `async_with_pinned_mem` mode requires significant
+   CPU memory for pinned buffers that persist between checkpoints. From PyTorch
+   docs: pinned memory uses page-locked memory which "can be scarce as compared
+   to pageable memory."
+
+2. **GIL Contention**: Async modes use background threads that compete for
+   Python's Global Interpreter Lock (GIL), which can cause CPU stalls and
+   temporarily reduce training throughput during checkpoint writes.
+
+3. **Memory Multiplication**: Async checkpointing copies model state to CPU
+   buffers, effectively multiplying memory requirements by
+   `checkpoint_size_per_rank × number_of_ranks`.
+
+4. **Simplicity**: Synchronous checkpointing is predictable—training blocks
+   until save completes, making debugging easier.
+
+### When to Enable Each Mode
+
+```toml
+# For debugging/development (simplest, most predictable)
+[checkpoint]
+async_mode = "disabled"
+
+# For most production training (good balance of speed vs memory)
+[checkpoint]
+async_mode = "async"
+
+# For maximum throughput (requires ample CPU memory)
+[checkpoint]
+async_mode = "async_with_pinned_mem"
+```
+
+**Recommendation from TorchTitan source code**: "Use `async_with_pinned_mem` for
+production training (near-zero overhead)" — but only if you have sufficient CPU
+memory.
+
+### Performance Characteristics
+
+At scale (1856 GPUs training Llama3-70B), async checkpointing with cached plans
+reduced background processing time from ~436 seconds to ~67 seconds (6.5x
+improvement). For the Llama 3.1 8B model, TorchTitan achieves 5-15x reduction in
+checkpointing overhead compared to synchronous distributed checkpointing.
+
+### Considerations
+
+1. **FSDP CPU Offload Conflict**: If using `training.enable_cpu_offload=true`,
+   be cautious with `async_with_pinned_mem` as both compete for CPU memory.
+
+2. **Checkpoint Frequency**: If checkpointing every 1000+ steps, synchronous
+   save overhead may be negligible compared to total training time.
+
+3. **Large Models**: For very large models (70B+), async checkpointing becomes
+   more important as synchronous saves can take many minutes.
+
+4. **Pinned Memory Persistence**: With `async_with_pinned_mem`, the staging
+   buffer is maintained between checkpoints, causing sustained memory pressure
+   throughout training (unlike `async` mode where buffers are released after
+   each save).
+
+---
+
 ## A general guide to use checkpoints during training
 
 1. ENABLE CHECKPOINTING

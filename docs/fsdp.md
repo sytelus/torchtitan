@@ -1,5 +1,8 @@
 # FSDP1 -> FSDP2
 
+If you are new to TorchTitan's configuration or mesh model, read
+`docs/config_reference.md` and `docs/parallelism_primer.md` first.
+
 ## Why FSDP2?
 PyTorch's fully sharded data parallelism (FSDP) API, [`FullyShardedDataParallel`](https://pytorch.org/docs/stable/fsdp.html), looks to offer a performant eager-mode implementation, including communication bucketing and communication/computation overlap. It defines a `FlatParameter` by flattening and concatenating a group of parameters to represent a communication bucket. However, this `FlatParameter` complicates applying different behaviors to individual parameters within the `FlatParameter`, e.g. parameter freezing, parameter casting, etc., hurting composability, and it complicates the internal implementation, e.g. making state dict logic thousands of lines and requiring additional communications.
 
@@ -62,6 +65,66 @@ def fully_shard(
     | 2 `process_group`s/2D `device_mesh` + `HYBRID_SHARD` | 2D `mesh` + `reshard_after_forward=True` | MiCS |
     | 2 `process_group`s/2D `device_mesh` + `_HYBRID_SHARD_ZERO2` | 2D `mesh` + `reshard_after_forward=False` | - |
     | - | 1D/2D `mesh` + `reshard_after_forward=8` (`int`) | ZeRO++ hpZ |
+
+## Understanding `reshard_after_forward`
+
+### What Resharding Means
+
+In FSDP, parameters are sharded across GPUs. During forward:
+
+1. **All-gather**: Collect full parameters from all ranks
+2. **Compute**: Run the layer with full parameters
+3. **Reshard** (optional): Free the gathered parameters, keep only local shard
+
+### Configuration Options
+
+| Setting | Memory | Communication | Best For |
+|---------|--------|---------------|----------|
+| `true` (always) | Low (only local shards) | High (all-gather every forward AND backward) | Memory-constrained |
+| `false` (never) | High (full params kept) | Low (all-gather once per step) | Compute-bound |
+| `int` (e.g., 8) | Medium | Medium (reshard to smaller group) | Balanced |
+
+### TorchTitan's Default Behavior
+
+In TorchTitan, the config option `fsdp_reshard_after_forward` can be:
+- `"default"` - Let TorchTitan decide based on PP
+- `"always"` - Always reshard after forward
+- `"never"` - Never reshard after forward
+
+**Why Pipeline Parallel changes the default**:
+
+```python
+# From parallelize.py
+reshard_after_forward = not pp_enabled  # Default behavior
+```
+
+With Pipeline Parallel, each forward pass processes a micro-batch. If we
+reshard after each forward, we must all-gather again for the next micro-batch's
+forward, which is extremely expensive:
+
+```
+Without resharding (PP + default):
+┌─────────────────────────────────────────────────────────────────────┐
+│ Micro-batch 0: all-gather → forward                                │
+│ Micro-batch 1: forward (params already gathered)                   │
+│ Micro-batch 2: forward                                             │
+│ ...                                                                 │
+│ All micro-batches done: reshard → backward                         │
+└─────────────────────────────────────────────────────────────────────┘
+
+With resharding (PP + always):
+┌─────────────────────────────────────────────────────────────────────┐
+│ Micro-batch 0: all-gather → forward → reshard                      │
+│ Micro-batch 1: all-gather → forward → reshard  ← EXPENSIVE!       │
+│ Micro-batch 2: all-gather → forward → reshard  ← EXPENSIVE!       │
+│ ...                                                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Summary**:
+- **Non-PP training**: Reshard after forward to save memory (only one
+  forward/backward per step)
+- **PP training**: Don't reshard to avoid repeated all-gathers for micro-batches
 - FSDP2 maps `mixed_precision` to `mp_policy` and `cpu_offload` to `offload_policy`.
   - For `mp_policy`, we remove `buffer_dtype`, simplify `cast_forward_inputs` and `cast_root_forward_inputs` into just `cast_forward_inputs`, and add an `output_dtype`.
   - For `offload_policy`, we add a `pin_memory` option to avoid pinning CPU memory. (This feature may not have landed yet.)
