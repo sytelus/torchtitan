@@ -1,0 +1,77 @@
+# GPT-2 Debug Configuration
+# =========================
+# Single GPU training with tiny Shakespeare dataset
+# For learning TorchTitan basics without multi-GPU setup
+
+[job]
+dump_folder = "./outputs/gpt2_debug"
+description = "GPT-2 debug training on tiny Shakespeare"
+print_config = true
+
+[profiling]
+enable_profiling = false
+enable_memory_snapshot = false
+save_traces_folder = "profile_trace"
+profile_freq = 10
+
+[metrics]
+log_freq = 1
+disable_color_printing = false
+enable_tensorboard = false
+enable_wandb = false
+
+[model]
+name = "gpt2"
+flavor = "debugmodel"
+# Download GPT-2 tokenizer: python scripts/download_hf_assets.py --repo_id openai-community/gpt2 --assets tokenizer --local_dir ./assets/hf/gpt2
+hf_assets_path = "./assets/hf/gpt2"
+
+[optimizer]
+name = "AdamW"
+lr = 6e-4
+eps = 1e-8
+weight_decay = 0.1
+betas = [0.9, 0.95]
+
+[lr_scheduler]
+warmup_steps = 100
+decay_ratio = 0.9
+decay_type = "cosine"
+min_lr_factor = 0.1
+
+[training]
+local_batch_size = 8
+seq_len = 1024
+max_norm = 1.0
+steps = 1000
+dataset = "tiny_shakespeare"
+mixed_precision_param = "bfloat16"
+mixed_precision_reduce = "float32"
+
+[training.dataloader]
+num_workers = 2
+pin_memory = false
+
+[parallelism]
+# Single GPU - no parallelism
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 1
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+
+[checkpoint]
+enable = false
+interval = 500
+folder = "checkpoint"
+export_dtype = "bfloat16"
+
+[activation_checkpoint]
+mode = "none"
+
+[compile]
+enable = false
+components = ["model"]
+
+[validation]
+enable = false

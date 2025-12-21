@@ -32,6 +32,28 @@ def _process_c4_text(sample: dict[str, Any]) -> str:
     return sample["text"]
 
 
+def _load_openwebtext_dataset(dataset_path: str):
+    """Load OpenWebText dataset (sytelus/openwebtext on HuggingFace)."""
+    return load_dataset(dataset_path, split="train", streaming=True)
+
+
+def _process_openwebtext_text(sample: dict[str, Any]) -> str:
+    """Process OpenWebText dataset sample text."""
+    return sample["text"]
+
+
+def _load_tiny_shakespeare_dataset(dataset_path: str):
+    """Load tiny Shakespeare dataset (karpathy/tiny_shakespeare on HuggingFace)."""
+    # Note: tiny_shakespeare has a single long text per split, so we load as map-style
+    # and the HuggingFaceTextDataset will handle it appropriately
+    return load_dataset(dataset_path, split="train", trust_remote_code=True)
+
+
+def _process_shakespeare_text(sample: dict[str, Any]) -> str:
+    """Process Shakespeare dataset sample text."""
+    return sample["text"]
+
+
 # Add your dataset here - more information at docs/datasets.md
 DATASETS = {
     "c4": DatasetConfig(
@@ -48,6 +70,20 @@ DATASETS = {
         path="allenai/c4",
         loader=partial(_load_c4_dataset, split="validation"),
         sample_processor=_process_c4_text,
+    ),
+    # OpenWebText dataset (from sytelus/openwebtext on HuggingFace)
+    # First 5GB of OpenWebText, ~8M rows
+    "openwebtext": DatasetConfig(
+        path="sytelus/openwebtext",
+        loader=_load_openwebtext_dataset,
+        sample_processor=_process_openwebtext_text,
+    ),
+    # Tiny Shakespeare dataset (from karpathy/tiny_shakespeare on HuggingFace)
+    # ~40k lines of Shakespeare for debugging and learning
+    "tiny_shakespeare": DatasetConfig(
+        path="karpathy/tiny_shakespeare",
+        loader=_load_tiny_shakespeare_dataset,
+        sample_processor=_process_shakespeare_text,
     ),
 }
 

@@ -1,0 +1,90 @@
+# GPT-2 124M Training Configuration
+# ==================================
+# 8 GPU DDP training with OpenWebText dataset
+# Based on Keller Jordan's optimized nanoGPT run from nanuGPT
+# https://github.com/sytelus/nanuGPT/blob/main/configs/train_gpt2/openwebtext_tokens10b_keller_adamw.yaml
+
+[job]
+dump_folder = "./outputs/gpt2_124m_openwebtext"
+description = "GPT-2 124M training on OpenWebText with 8 GPU DDP"
+print_config = true
+
+[profiling]
+enable_profiling = false
+enable_memory_snapshot = false
+save_traces_folder = "profile_trace"
+profile_freq = 100
+
+[metrics]
+log_freq = 10
+disable_color_printing = false
+enable_tensorboard = true
+enable_wandb = true
+
+[model]
+name = "gpt2"
+flavor = "124M"
+# Download GPT-2 tokenizer: python scripts/download_hf_assets.py --repo_id openai-community/gpt2 --assets tokenizer --local_dir ./assets/hf/gpt2
+hf_assets_path = "./assets/hf/gpt2"
+
+[optimizer]
+name = "AdamW"
+lr = 1.8e-3           # From Keller Jordan's optimized run
+eps = 1e-8
+weight_decay = 0.1
+betas = [0.9, 0.95]
+
+[lr_scheduler]
+warmup_steps = 256    # From Keller Jordan's config
+decay_ratio = 0.6     # Train for 60%, cooldown for 40%
+decay_type = "cosine"
+min_lr_factor = 0.1
+
+[training]
+# Batch size: 64 per GPU * 8 GPUs = 512 global
+local_batch_size = 64
+seq_len = 1024
+max_norm = 1.0
+# Steps: ~20k steps to cover ~10B tokens
+# tokens = steps * global_batch_size * seq_len = 20345 * 512 * 1024 ≈ 10.67B
+steps = 20345
+dataset = "openwebtext"
+mixed_precision_param = "bfloat16"
+mixed_precision_reduce = "float32"
+
+[training.dataloader]
+num_workers = 4
+pin_memory = true
+
+[parallelism]
+# 8-way DDP (no FSDP, no TP)
+# Each GPU has full model replica, gradients are synchronized
+data_parallel_replicate_degree = 8  # DDP across 8 GPUs
+data_parallel_shard_degree = 1      # No FSDP sharding
+tensor_parallel_degree = 1          # No tensor parallelism
+pipeline_parallel_degree = 1        # No pipeline parallelism
+context_parallel_degree = 1         # No context parallelism
+
+[checkpoint]
+enable = true
+interval = 5000
+folder = "checkpoint"
+export_dtype = "bfloat16"
+last_save_model_only = true
+
+[activation_checkpoint]
+# GPT-2 124M fits in memory without AC
+mode = "none"
+
+[compile]
+enable = true
+components = ["model"]
+backend = "inductor"
+
+[validation]
+enable = true
+dataset = "openwebtext"
+freq = 500
+steps = 100
+local_batch_size = 64
+seq_len = 1024
