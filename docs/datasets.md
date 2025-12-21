@@ -258,3 +258,224 @@ TorchTitan tokenizes during iteration rather than pre-tokenizing because:
 4. **Checkpointing**: Can resume from any point by saving buffer state
 
 The trade-off is slightly higher CPU usage during training, but this is typically not a bottleneck when training on GPUs.
+
+---
+
+## Multi-Stage Training and Dataset Sequencing
+
+TorchTitan currently uses a **single dataset per training run**. Multi-stage training
+with different datasets requires external orchestration.
+
+### Current Limitation
+
+Each training run is configured with one dataset:
+```toml
+[training]
+dataset = "c4"          # Single dataset for the entire run
+```
+
+### How to Implement Multi-Stage Training
+
+**Approach: External Orchestration**
+
+Run separate training jobs with checkpoint continuation:
+
+```bash
+# Stage 1: Pre-training on large general corpus
+./run_train.sh \
+    --training.dataset c4 \
+    --training.steps 100000 \
+    --checkpoint.enable
+
+# Stage 2: Fine-tuning on domain-specific data
+./run_train.sh \
+    --training.dataset dolma3_longmino \
+    --training.steps 110000 \
+    --checkpoint.enable \
+    --checkpoint.initial_load_path ./outputs/checkpoint/step-100000 \
+    --checkpoint.exclude_from_loading dataloader
+```
+
+**Key points:**
+- Use `initial_load_path` to load the model from the previous stage
+- Use `exclude_from_loading` to skip dataloader state (new dataset has different position)
+- Optionally exclude `lr_scheduler` if changing learning rate schedule
+
+### Validation Dataset
+
+TorchTitan supports a **separate validation dataset** during training:
+
+```toml
+[training]
+dataset = "c4"
+
+[validation]
+enable = true
+dataset = "c4_validation"    # Different dataset for validation
+freq = 100                   # Validate every 100 steps
+```
+
+This runs periodic validation without switching the training dataset.
+
+### Future Considerations
+
+For curriculum learning or dataset mixing, consider:
+1. **Custom TrainSpec**: Create a wrapper dataloader that switches datasets
+2. **Pre-mixed datasets**: Combine datasets before training using HuggingFace's `interleave_datasets`
+3. **External scheduler**: Use a job scheduler to orchestrate multiple training runs
+
+---
+
+## Batch Construction: Packing vs Padding
+
+TorchTitan uses **sequence packing** (not padding) for efficient batch construction.
+
+### How It Works
+
+Documents are concatenated into a continuous token stream, then sliced into
+fixed-length sequences:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Document Packing (NO padding used)                                          │
+│                                                                              │
+│  Doc 1: "Hello world" → [BOS, Hello, world, EOS]                            │
+│  Doc 2: "AI is great" → [BOS, AI, is, great, EOS]                           │
+│  Doc 3: "LLMs learn"  → [BOS, LLMs, learn, EOS]                             │
+│                                                                              │
+│  Token buffer (concatenated):                                                │
+│  [BOS, Hello, world, EOS, BOS, AI, is, great, EOS, BOS, LLMs, learn, EOS]   │
+│                                                                              │
+│  With seq_len=6, yields sequences by slicing (no padding!):                 │
+│  Seq 1: [BOS, Hello, world, EOS, BOS, AI]                                   │
+│  Seq 2: [is, great, EOS, BOS, LLMs, learn]                                  │
+│  ...                                                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why Packing Instead of Padding?
+
+| Aspect | Padding | Packing (TorchTitan) |
+|--------|---------|----------------------|
+| GPU utilization | Wasted on pad tokens | 100% useful tokens |
+| Memory efficiency | Stores padding | No waste |
+| Batch consistency | Variable effective length | Fixed length |
+| Implementation | Simple | Slightly complex |
+
+### Document Boundaries and Cross-Document Attention
+
+With packing, documents are concatenated and the model sees `[..., EOS, BOS, ...]`
+transitions. By default, **cross-document attention is allowed** (standard causal mask).
+
+**To prevent cross-document attention**, use `attn_mask_type="block_causal"`:
+
+```
+Packed sequence: [BOS, A, B, EOS, BOS, C, D, EOS]
+                  └──Doc 1──┘    └──Doc 2──┘
+
+attn_mask_type="causal" (default):
+  - Token C can attend to A, B (cross-document attention allowed)
+
+attn_mask_type="block_causal":
+  - Token C can only attend to C, D (same document)
+  - EOS tokens mark document boundaries
+```
+
+**Configuration:**
+- Requires `attn_type="flex"` or `attn_type="varlen"` (not default SDPA)
+- Some model flavors have this enabled: `8B_flex`, `8B_varlen`
+- Document boundaries identified by EOS token positions
+
+```python
+# Model args (in model's __init__.py)
+ModelArgs(
+    attn_mask_type="block_causal",  # Enable document masking
+    attn_type="flex",                # Required for mask to take effect
+)
+```
+
+**Note:** Standard text pre-training often allows cross-document attention, as the
+model learns to handle document transitions naturally via EOS/BOS tokens.
+
+### BOS and EOS Token Configuration
+
+TorchTitan supports configurable BOS (Beginning of Sequence) and EOS (End of Sequence)
+tokens. Unlike some frameworks (e.g., NanoGPT which uses EOS-only), TorchTitan's text
+dataset currently adds both by default.
+
+**Tokenizer-level support:**
+
+The `HuggingFaceTokenizer` reads defaults from `tokenizer_config.json` and allows
+overrides:
+
+```python
+# Tokenizer infers defaults from config
+tokenizer = HuggingFaceTokenizer("/path/to/tokenizer")
+# tokenizer_config.json can set: "add_bos_token": true, "add_eos_token": true
+
+# encode() accepts overrides
+tokens = tokenizer.encode(text, add_bos=False, add_eos=True)  # EOS-only
+```
+
+**Current dataset behavior:**
+
+The text dataset (`HuggingFaceTextDataset`) currently hardcodes both tokens:
+
+```python
+# In text_datasets.py
+sample_tokens = self._tokenizer.encode(
+    sample_text, add_bos=True, add_eos=True  # Both enabled
+)
+```
+
+**To use EOS-only (NanoGPT-style):**
+
+1. **Modify the dataset class** in `text_datasets.py`:
+   ```python
+   sample_tokens = self._tokenizer.encode(
+       sample_text, add_bos=False, add_eos=True
+   )
+   ```
+
+2. **Or create a custom dataset** with your preferred tokenization.
+
+**Important:** For `block_causal` attention masking, only EOS tokens are required
+to mark document boundaries. BOS tokens are not used for boundary detection.
+
+| Token | Purpose | Required for Masking |
+|-------|---------|---------------------|
+| BOS | Marks sequence start | No |
+| EOS | Marks document end | Yes (for `block_causal`) |
+
+### Customizing Batch Construction
+
+**Sequence length:**
+```toml
+[training]
+seq_len = 4096    # Tokens per sequence
+```
+
+**Batch size:**
+```toml
+[training]
+local_batch_size = 8    # Sequences per GPU
+```
+
+**DataLoader workers:**
+```toml
+[training.dataloader]
+num_workers = 2
+pin_memory = true
+```
+
+### Multimodal Datasets
+
+For VLM training, TorchTitan's experimental multimodal datasets support optional
+packing via `packing_buffer_size`:
+
+```python
+# In VLM config
+packing_buffer_size = 0     # 0 = disabled, >0 = enable packing
+```
+
+Multimodal collators may add padding for image tokens to align batch dimensions.

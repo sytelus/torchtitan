@@ -2,6 +2,144 @@
 
 You may want to enable checkpointing in `torchtitan` for better fault tolerance during training, or to enable easier importing and exporting of weights between `torchtitan` and other libraries. `torchtitan` offers varying degrees of support for other checkpoint formats which are listed further below.
 
+## Checkpoint Formats
+
+TorchTitan supports three checkpoint formats, each suited for different use cases:
+
+### DCP (Distributed Checkpoint) - Default
+
+PyTorch's native distributed checkpoint format. Each rank saves its shard independently.
+
+**File structure:**
+```
+{dump_folder}/{checkpoint.folder}/
+├── step-1000/
+│   ├── __0_0.distcp    # Rank 0 shard
+│   ├── __0_1.distcp    # Rank 1 shard
+│   └── .metadata       # Distributed metadata
+└── step-2000/
+```
+
+**What's saved:**
+| Key | Contents | Purpose |
+|-----|----------|---------|
+| `model` | Model parameters (DTensor-aware) | Resume training, inference |
+| `optimizer` | Optimizer states (momentum, variance) | Resume training exactly |
+| `lr_scheduler` | LR schedule position | Continue schedule |
+| `dataloader` | Iterator position | Avoid repeating data |
+| `train_state` | Step count, tokens seen | Training progress |
+
+**When to use:** Training with resumption, distributed training, optimizer state preservation.
+
+### HuggingFace Safetensors
+
+Modern HuggingFace format for safe, fast loading. Compatible with HuggingFace ecosystem.
+
+**File structure:**
+```
+{checkpoint_id}/
+├── model.safetensors              # Single file OR
+├── model-00001-of-00004.safetensors
+├── model-00002-of-00004.safetensors
+├── ...
+└── model.safetensors.index.json   # FQN to file mapping
+```
+
+**Important:** Only saves model weights (no optimizer/scheduler state).
+
+**When to use:** Sharing models with HuggingFace ecosystem, inference with `transformers` library.
+
+### PyTorch Native (.pt)
+
+Standard PyTorch format, single file.
+
+**When to use:** Simple inference, non-distributed use, compatibility with standard PyTorch tools.
+
+### Format Comparison
+
+| Format | Distributed Save | All State | Ecosystem | Best For |
+|--------|-----------------|-----------|-----------|----------|
+| DCP | Yes | Yes | TorchTitan | Training resumption |
+| Safetensors | Consolidated | Model only | HuggingFace | Inference, sharing |
+| .pt | Consolidated | Model only | PyTorch | Simple workflows |
+
+---
+
+## Resuming Training After Pre-emption
+
+TorchTitan's checkpoint system enables seamless resumption after crashes or pre-emption.
+
+### What Gets Restored
+
+When loading a checkpoint, TorchTitan restores:
+1. **Model parameters** - Exact weights from checkpoint
+2. **Optimizer state** - Momentum, variance (for Adam/AdamW)
+3. **LR scheduler** - Position in warmup/decay schedule
+4. **Dataloader position** - Exact sample index (no data repetition)
+5. **Training step** - Continue from correct step number
+
+### How to Resume
+
+**Automatic (latest checkpoint):**
+```bash
+# Just run training again - it automatically loads latest checkpoint
+./run_train.sh --checkpoint.enable
+```
+
+**Specific step:**
+```bash
+./run_train.sh --checkpoint.enable --checkpoint.load_step 10000
+```
+
+**From different path (e.g., pre-trained model):**
+```bash
+./run_train.sh --checkpoint.enable \
+    --checkpoint.initial_load_path /path/to/pretrained \
+    --checkpoint.initial_load_model_only true
+```
+
+### Checkpoint Discovery
+
+TorchTitan automatically finds checkpoints:
+1. Scans `{dump_folder}/{checkpoint.folder}/` for `step-*` directories
+2. Validates each by checking for `.metadata` (DCP) or `model.safetensors.index.json` (HF)
+3. Returns the maximum step found (or specific step if `load_step` is set)
+
+### Partial Loading
+
+Skip specific components when resuming:
+```toml
+[checkpoint]
+enable = true
+exclude_from_loading = ["dataloader", "lr_scheduler"]
+```
+
+Use cases:
+- Change learning rate schedule mid-training
+- Resume with different batch size (skip dataloader state)
+- Fine-tune from pre-trained (load model only)
+
+### Fault Tolerance with TorchFT
+
+For elastic training with node failures, TorchTitan integrates with TorchFT:
+
+```toml
+[fault_tolerance]
+enable = true
+min_replica_size = 1    # Continue with at least 1 replica
+
+[checkpoint]
+enable = true
+enable_ft_dataloader_checkpoints = true  # Per-replica dataloader state
+```
+
+TorchFT provides:
+- **Dual checkpointing**: Full checkpoint + per-replica dataloader state
+- **Elastic recovery**: Surviving replicas continue; failed replicas rejoin
+- **Semi-synchronous training**: DiLoCo or LocalSGD for async gradient updates
+
+---
+
 ## Async Checkpointing
 
 Standard synchronous checkpointing blocks training while saving, which can take

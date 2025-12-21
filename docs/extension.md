@@ -133,3 +133,124 @@ Or specify it in your `.toml` config:
 [job]
 custom_config_module = "torchtitan.experiments.your_folder.job_config"
 ```
+
+
+### Learning Rate Scheduler Customization
+
+TorchTitan uses `LambdaLR` via `LRSchedulersContainer` with three decay types:
+
+#### Available Schedules
+
+```toml
+[lr_scheduler]
+warmup_steps = 2000        # Linear warmup steps
+decay_ratio = 0.8          # When to start decay (0.8 = last 80% of training)
+decay_type = "cosine"      # "linear", "sqrt", or "cosine"
+min_lr_factor = 0.1        # Don't go below 10% of base LR
+```
+
+**Schedule patterns:**
+- **Warmup-Decay (WD)**: Set `decay_ratio = null` - decay starts immediately after warmup
+- **Warmup-Stable-Decay (WSD)**: Set `decay_ratio = 0.8` - stable LR after warmup, decay in last 80%
+
+#### Custom LR Scheduler
+
+Create a custom scheduler by overriding `build_lr_schedulers_fn` in your TrainSpec:
+
+```python
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.config import LRScheduler as LRSchedulerConfig
+import functools
+
+def build_custom_lr_schedulers(
+    optimizers: OptimizersContainer,
+    lr_scheduler_config: LRSchedulerConfig,
+    training_steps: int,
+) -> LRSchedulersContainer:
+    """Custom scheduler with your own schedule logic."""
+
+    def my_schedule(current_step, warmup_steps, total_steps):
+        if current_step < warmup_steps:
+            return float(current_step) / warmup_steps  # Linear warmup
+        # Your custom decay logic
+        progress = (current_step - warmup_steps) / (total_steps - warmup_steps)
+        return max(0.1, 1.0 - progress * 0.9)  # Linear decay to 10%
+
+    lr_lambda = functools.partial(
+        my_schedule,
+        warmup_steps=lr_scheduler_config.warmup_steps,
+        total_steps=training_steps,
+    )
+
+    return LRSchedulersContainer(optimizers, lr_lambda)
+
+# Register in TrainSpec
+train_spec = TrainSpec(
+    ...
+    build_lr_schedulers_fn=build_custom_lr_schedulers,
+)
+```
+
+
+### Custom Optimizers
+
+TorchTitan currently supports **Adam** and **AdamW** only. To add custom optimizers
+(e.g., Muon, LAMB, Sophia), modify the `build_optimizers` function or create a
+custom TrainSpec.
+
+#### Current Optimizer Configuration
+
+```toml
+[optimizer]
+name = "AdamW"              # "Adam" or "AdamW"
+lr = 8e-4
+beta1 = 0.9
+beta2 = 0.95
+eps = 1e-8
+weight_decay = 0.1
+implementation = "fused"    # "fused", "foreach", or "for-loop"
+```
+
+#### Adding a Custom Optimizer (e.g., Muon)
+
+Muon and other optimizers are **not currently supported**. To add one:
+
+**Option 1: Modify optimizer.py directly**
+
+```python
+# In torchtitan/components/optimizer.py, add to optimizer_classes dict:
+optimizer_classes = {
+    "Adam": torch.optim.Adam,
+    "AdamW": torch.optim.AdamW,
+    "Muon": muon.Muon,  # Add import and class
+}
+```
+
+**Option 2: Create custom TrainSpec (recommended)**
+
+```python
+from torchtitan.protocols.train_spec import TrainSpec
+from torchtitan.components.optimizer import OptimizersContainer
+import muon  # Your optimizer library
+
+def build_custom_optimizers(model_parts, optimizer_config, parallel_dims, ft_manager=None):
+    """Build Muon optimizer for all model parts."""
+    optimizers = []
+    for model in model_parts:
+        opt = muon.Muon(
+            model.parameters(),
+            lr=optimizer_config.lr,
+            momentum=optimizer_config.beta1,
+        )
+        optimizers.append(opt)
+    return OptimizersContainer(optimizers, ...)
+
+train_spec = TrainSpec(
+    ...
+    build_optimizers_fn=build_custom_optimizers,
+)
+```
+
+**Note:** Custom optimizers may require additional handling for distributed training
+(FSDP sharding, gradient scaling, etc.).

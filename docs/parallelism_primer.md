@@ -665,8 +665,34 @@ Input: [batch, seq, hidden]
 
 ### Sequence Parallel Integration
 
-Between TP operations, activations are kept **sharded on the sequence
-dimension** (Shard(1)) to save memory. This is called Sequence Parallel:
+Sequence Parallelism (SP) is a memory optimization technique that keeps activations
+**sharded on the sequence dimension** (Shard(1)) between TP operations. Unlike
+Context Parallelism which reduces attention memory, SP reduces activation memory
+for non-attention operations.
+
+#### What is Sequence Parallelism?
+
+SP shards intermediate activations along the sequence dimension to reduce per-GPU
+memory usage:
+
+```
+Without SP (TP only):
+GPU 0: Full activations [batch, seq_len, hidden]     ← Full sequence stored
+GPU 1: Full activations [batch, seq_len, hidden]
+
+With SP (TP + SP):
+GPU 0: Sharded activations [batch, seq_len/tp, hidden]  ← 1/tp of sequence
+GPU 1: Sharded activations [batch, seq_len/tp, hidden]
+```
+
+**Memory savings**: With TP=4, SP reduces activation memory by 4× for operations
+that support sequence sharding (LayerNorm, dropout, residual connections).
+
+#### How SP Works with TP
+
+SP leverages the fact that some operations (LayerNorm, dropout) are element-wise
+and can operate on sharded sequences. TP operations that need full sequences
+use `PrepareModuleInput` to gather before computation:
 
 ```python
 # From parallelize.py - the TP plan for each layer
@@ -684,6 +710,67 @@ layer_plan = {
     "feed_forward.w2": RowwiseParallel(output_layouts=Shard(1)),
 }
 ```
+
+**Data flow through a layer with SP**:
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Sequence Parallel Data Flow (TP=2)                                          │
+│                                                                              │
+│  Input: [batch, seq, hidden] as Shard(1) ← Sharded on sequence dimension    │
+│         GPU 0: [batch, seq/2, hidden]                                        │
+│         GPU 1: [batch, seq/2, hidden]                                        │
+│                           │                                                  │
+│                           ▼                                                  │
+│  LayerNorm (SequenceParallel) ← Works on sharded sequence, no communication │
+│                           │                                                  │
+│                           ▼                                                  │
+│  PrepareModuleInput: Shard(1) → Replicate ← All-gather sequence             │
+│         GPU 0: [batch, seq, hidden]                                          │
+│         GPU 1: [batch, seq, hidden]                                          │
+│                           │                                                  │
+│                           ▼                                                  │
+│  Attention (ColwiseParallel/RowwiseParallel) ← TP compute                   │
+│                           │                                                  │
+│                           ▼                                                  │
+│  Output (RowwiseParallel with output_layouts=Shard(1))                       │
+│         GPU 0: [batch, seq/2, hidden] ← Reduce-scatter back to sharded      │
+│         GPU 1: [batch, seq/2, hidden]                                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### SP vs Context Parallelism: Key Differences
+
+| Aspect | Sequence Parallelism (SP) | Context Parallelism (CP) |
+|--------|---------------------------|--------------------------|
+| **What it shards** | Activations between TP ops | Sequence during attention |
+| **Memory savings** | Activation memory | Attention memory (O(seq²)) |
+| **Communication** | None (uses TP's collectives) | Ring attention rotations |
+| **When enabled** | Automatic with TP | Explicit `cp_degree > 1` |
+| **Requires** | TP enabled | Can work standalone |
+| **Best for** | Medium sequences, large TP | Very long sequences (8K+) |
+
+**SP is NOT the same as CP**:
+- SP shards activations but computes full attention (O(seq²))
+- CP shards the sequence and uses ring attention (O(seq²/cp))
+- SP and CP can be combined for maximum memory efficiency
+
+#### When to Use SP
+
+SP is **automatically enabled** when TP is configured. No separate configuration
+needed. Benefits are proportional to TP degree:
+
+| TP Degree | Activation Memory Reduction |
+|-----------|----------------------------|
+| TP=1 | No SP (not applicable) |
+| TP=2 | ~50% |
+| TP=4 | ~75% |
+| TP=8 | ~87.5% |
+
+**SP is most beneficial when**:
+- Model has large hidden dimension (activation memory is significant)
+- Using TP=4 or higher
+- Memory-constrained with medium sequence lengths
 
 ---
 
@@ -1113,6 +1200,52 @@ assert seq_len % seq_len_divisor == 0, \
 
 **Rule of thumb**: Target 4K-8K tokens per GPU per CP chunk for optimal
 efficiency. Going below 2K increases communication overhead.
+
+### Why CP Requires Dedicated Ranks
+
+A common question: "Ring attention just rotates KV among existing ranks, so why
+does CP need extra GPUs?"
+
+The answer lies in how TorchTitan integrates CP with FSDP for correctness and
+efficiency:
+
+```python
+# From parallel_dims.py - the key insight
+fsdp = self.dp_shard * self.cp  # CP ranks are part of FSDP mesh!
+```
+
+**CP is combined with FSDP because:**
+
+1. **Gradient synchronization**: CP splits the sequence (data-parallel effect on
+   loss), so gradients must be reduced across CP ranks. FSDP handles this via its
+   reduce-scatter on the combined `fsdp = dp_shard × cp` dimension.
+
+2. **Memory efficiency**: FSDP's all-gather pattern is more efficient than
+   replicating full model weights across CP ranks. The all-gather for parameters
+   can overlap with ring attention's KV rotation.
+
+3. **Correct loss computation**: The loss mesh flattens both batch and CP
+   dimensions together because both represent data parallelism:
+   ```python
+   loss_mesh = dataloading_mesh["batch", "cp"]._flatten("loss_mesh")
+   ```
+
+**Mesh structure with CP:**
+```
+FSDP mesh dimension = dp_shard × cp
+
+Example: dp_shard=4, cp=4 on 16 GPUs
+- Each CP rank processes 1/4 of the sequence
+- FSDP shards model across all 16 GPUs (4 × 4)
+- Ring attention rotates KV within CP groups
+- FSDP all-gather brings parameters to each GPU
+- Both communication patterns overlap during forward pass
+```
+
+**Key takeaway**: CP doesn't just add more rotation partners—it integrates with
+FSDP to ensure correct gradient synchronization and efficient memory usage. The
+`world_size = dp_replicate × dp_shard × cp × tp × pp` relationship means CP ranks
+are dedicated participants in the distributed training mesh.
 
 ---
 
@@ -1826,7 +1959,62 @@ NGPU=1 ./run_train.sh --job.config_file=path/to/debug_model.toml
 
 ### Communication Modes for Debugging
 
-TorchTitan supports special communication modes for debugging:
+TorchTitan supports three communication modes for different debugging scenarios:
+
+| Mode | Purpose | What It Does |
+|------|---------|--------------|
+| `default` | Normal training | Real distributed communication via NCCL/Gloo |
+| `fake_backend` | Config validation | Validates parallelism config without real GPUs |
+| `local_tensor` | Numerics debugging | Simulates multi-rank on single process |
+
+#### `fake_backend` Mode: Configuration Validation
+
+Use this to validate complex parallelism configurations without GPU hardware:
+
+```bash
+# Validate a 5D parallelism config without needing 128 GPUs
+NGPU=128 COMM_MODE="fake_backend" python -m torchtitan.train \
+    --job.config_file ./config.toml \
+    --training.steps 1
+```
+
+**What it validates:**
+- Mesh dimension calculations are correct
+- Parallelism degrees multiply to world size
+- Model sharding constraints are satisfied (n_heads divisible by TP, etc.)
+
+**Limitations:**
+- No actual training occurs
+- Model weights are not initialized
+- Only validates configuration, not numerics
+
+#### `local_tensor` Mode: Numerics Debugging
+
+Use this to debug multi-rank behavior on a single GPU:
+
+```bash
+# Simulate 8-GPU FSDP on single GPU for debugging
+NGPU=8 COMM_MODE="local_tensor" python -m torchtitan.train \
+    --job.config_file ./debug_model.toml \
+    --training.steps 1
+```
+
+**What it enables:**
+- Verify numerics with fewer GPUs (test 5D parallelism on single node)
+- Debug rank-specific issues without multi-node setup
+- Compare outputs across parallelism configurations
+
+**How it works:**
+- Runs all ranks sequentially on single process
+- Uses PyTorch's `LocalTensorMode` to simulate distributed tensors
+- Same numerical results as distributed execution (just slower)
+
+**Limitations:**
+- **Experimental feature** - requires PyTorch's LocalTensorMode API
+- Currently skips actual training (validates config and initialization)
+- Much slower than real distributed (sequential rank execution)
+
+#### Configuration
 
 ```toml
 [comm]
@@ -1835,13 +2023,23 @@ mode = "default"      # Normal distributed training
 # mode = "fake_backend"  # Dry run: validates config without GPU
 ```
 
+#### When to Use Each Mode
+
+| Scenario | Mode | Why |
+|----------|------|-----|
+| Production training | `default` | Real distributed communication |
+| Validate config before cluster run | `fake_backend` | Quick validation without GPUs |
+| Debug parallelism numerics | `local_tensor` | Simulate multi-rank on single GPU |
+| CI/CD config tests | `fake_backend` | Fast, no GPU needed |
+| Compare outputs across configs | `local_tensor` | Same numerics, single machine |
+
 **Usage**:
 ```bash
 # Config validation without GPU
-COMM_MODE="fake_backend" ./run_train.sh
+NGPU=32 COMM_MODE="fake_backend" ./run_train.sh
 
 # Debug mode (single process, sequential ranks)
-COMM_MODE="local_tensor" ./run_train.sh
+NGPU=8 COMM_MODE="local_tensor" ./run_train.sh
 ```
 
 ### Where to Find Debug Configs
