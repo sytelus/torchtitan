@@ -24,36 +24,22 @@ Qwen3. You'll learn:
 
 ## Part 1: Installation
 
-### 1.1 Clone TorchTitan
-
-```bash
-git clone https://github.com/pytorch/torchtitan
-cd torchtitan
-```
-
-### 1.2 Install PyTorch Nightly
-
 TorchTitan requires PyTorch nightly for the latest distributed training features:
 
 ```bash
-# For CUDA 12.6 (recommended for A100)
-pip3 install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --force-reinstall
-
 # For CUDA 12.8 (recommended for B200/Blackwell)
 pip3 install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128 --force-reinstall
-```
 
-### 1.3 Install TorchTitan and Dependencies
+pip install torchao
 
-```bash
+git clone https://github.com/pytorch/torchtitan
+cd torchtitan
+
 # Install TorchTitan in development mode
 pip install -e .
-
-# Install TorchAO for FP8 support (optional)
-USE_CPP=0 pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu126
 ```
 
-### 1.4 Verify Installation
+Verify the installation:
 
 ```bash
 # Check PyTorch version and CUDA
@@ -63,9 +49,9 @@ python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {
 python -c "import torchtitan; print('TorchTitan installed successfully')"
 
 # Quick validation (single GPU, fake backend)
-NGPU=1 COMM_MODE=fake_backend python -m torchtitan.train \
+LOCAL_RANK=0 NGPU=1 python -m torchtitan.train \
     --job.config_file ./torchtitan/models/llama3/train_configs/debug_model.toml \
-    --training.steps 1
+    --comm.mode=fake_backend --training.steps 1
 ```
 
 ---
@@ -102,6 +88,77 @@ torchtitan/
    `model_args` in `__init__()`.
 
 3. **Parallelization Order**: TP → AC → compile → FSDP/DDP (order matters!)
+
+### Why Parallelization Order Matters
+
+The order in which parallelization techniques are applied is critical for correctness
+and performance. Here's why each step must occur in sequence:
+
+```
+Original Model
+     │
+     ▼
+[1] TP: Shard tensors across devices (establishes layouts)
+     │
+     ▼
+[2] AC: Wrap blocks in CheckpointWrapper (respects TP layouts)
+     │
+     ▼
+[3] Compile: Trace graph with AC visible (before FSDP hooks)
+     │
+     ▼
+[4] FSDP/DDP: Add communication hooks (final step, after graph traced)
+     │
+     ▼
+Build Optimizer (sees final sharded parameters)
+```
+
+**Step 1: Tensor Parallelism (TP) — First**
+
+TP splits tensors across devices (e.g., column-wise for embeddings, row-wise for
+attention outputs). It must be applied first because it establishes the tensor
+sharding layouts that all subsequent steps must respect.
+
+```python
+# Example: embeddings split column-wise across TP ranks
+"tok_embeddings": RowwiseParallel(
+    input_layouts=Replicate(),
+    output_layouts=Shard(1),
+)
+```
+
+**Step 2: Activation Checkpointing (AC) — Second**
+
+AC wraps transformer blocks in `CheckpointWrapper` to trade compute for memory
+(recompute activations during backward instead of storing them). It must:
+- Come **after TP** to respect the established tensor layouts
+- Come **before compile** so the compiler can see and optimize the checkpointing pattern
+
+**Step 3: torch.compile — Third**
+
+Compile traces the computation graph and generates optimized kernels. It must:
+- Come **after AC** to see the CheckpointWrapper and properly trace the control flow
+- Come **before FSDP** because FSDP adds communication hooks (all-gather,
+  reduce-scatter) that cause **graph breaks**
+
+```python
+# From parallelize.py - the comment explains the ordering
+# turn on per-TransformerBlock compile after AC wrapping and before FSDP
+if model_compile_enabled:
+    apply_compile(model, job_config.compile)
+```
+
+**Step 4: FSDP/DDP — Last**
+
+Data parallelism shards parameters across devices. Applied last because:
+- FSDP adds hooks that would break the torch.compile graph if applied earlier
+- The optimizer is built **after** parallelism, so it sees the final sharded parameters
+
+**The Graph-Breaking Problem**
+
+The critical constraint is avoiding graph breaks for `torch.compile`. If FSDP is
+applied before compile, the communication hooks fragment the graph, forcing
+activation checkpointing to fall back to eager execution — destroying performance.
 
 ---
 
