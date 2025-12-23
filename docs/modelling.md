@@ -443,8 +443,40 @@ checkpointing based on a memory/compute tradeoff:
 [activation_checkpoint]
 mode = "memory_budget"
 memory_budget = 0.5         # 0.0 = max memory savings, 1.0 = no checkpointing
-visualize_memory_budget_pareto = true  # Generate tradeoff visualization
 ```
+
+**Note:** Memory budget mode requires `torch.compile` to be enabled.
+
+### Visualizing Memory Budget Pareto Frontier
+
+To understand the memory vs. compute tradeoffs for your model, enable Pareto
+visualization:
+
+```toml
+[activation_checkpoint]
+mode = "memory_budget"
+memory_budget = 0.5
+visualize_memory_budget_pareto = true
+```
+
+**What it does:**
+- Generates an SVG visualization showing runtime vs. activation memory tradeoffs
+- Evaluates all memory budget values from 0.0 to 1.0 in increments of 0.05
+- Helps you choose the optimal `memory_budget` value for your use case
+
+**Output location:** `{job.dump_folder}/memory_budget_pareto/`
+
+**How to use:**
+1. Enable the visualization in your config
+2. Run training (the visualization is generated during the first compiled forward pass)
+3. Open the SVG file in the output directory to see the Pareto frontier
+4. Use the chart to select a `memory_budget` value that balances your memory and compute needs:
+   - Values closer to 0.0: Maximum memory savings, higher compute overhead
+   - Values closer to 1.0: Minimal memory savings, lower compute overhead
+5. Update your config with the chosen `memory_budget` value
+
+For more details on the visualization format, see the
+[PyTorch implementation example](https://github.com/pytorch/pytorch/pull/126320#discussion_r1625104015).
 
 ---
 

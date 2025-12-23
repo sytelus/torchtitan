@@ -400,7 +400,11 @@ prefetch_factor = 2
   Used only in `memory_budget` mode (requires compile).
 
 - `visualize_memory_budget_pareto` (default: false)
-  Dump a pareto SVG for memory vs compute tradeoffs.
+  Generates an SVG visualization of runtime vs. activation memory tradeoffs.
+  The visualization evaluates all memory budget values from 0.0 to 1.0 in
+  increments of 0.05, helping you choose the optimal `memory_budget` value.
+  Output is saved to `{job.dump_folder}/memory_budget_pareto/`. See
+  [modelling.md](modelling.md#visualizing-memory-budget-pareto-frontier) for usage details.
 
 - `preserve_rng_state` (default: false)
   Preserve RNG state for deterministic recomputation.
