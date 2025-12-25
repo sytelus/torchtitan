@@ -169,9 +169,14 @@ class GPT2Model(nn.Module, ModelProtocol):
         # Output projection (may be weight-tied with tok_embeddings)
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
 
-        # Weight tying
-        if model_args.weight_tying:
-            self.output.weight = self.tok_embeddings.weight
+        # NOTE: Weight tying is NOT applied here. It must be applied AFTER FSDP/DDP
+        # parallelization. If applied before FSDP, the shared parameter would be
+        # sharded twice (once for tok_embeddings, once for output), causing issues.
+        # See parallelize_gpt2() in infra/parallelize.py for where weight tying is applied.
+        #
+        # The Qwen3 model in TorchTitan uses the same pattern:
+        # - parallelize.py applies weight tying AFTER all parallelisms
+        # - This ensures both parameters are DTensors before being tied
 
         # Register position indices as buffer
         self.register_buffer(
@@ -254,6 +259,9 @@ class GPT2Model(nn.Module, ModelProtocol):
         self.norm.reset_parameters()
 
         # Initialize output (if not weight-tied)
+        # When weight_tying=True, output.weight shares the same tensor as
+        # tok_embeddings.weight (tied in parallelize_gpt2 after FSDP).
+        # Initializing tok_embeddings.weight above already initialized output.weight.
         if not self.model_args.weight_tying:
             nn.init.normal_(self.output.weight, mean=0.0, std=init_std)
 

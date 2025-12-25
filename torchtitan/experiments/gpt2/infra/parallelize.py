@@ -199,9 +199,38 @@ def parallelize_gpt2(
         logger.info("No data parallelism applied (single GPU mode)")
 
     # =========================================================================
-    # STEP 3: TORCH.COMPILE (WHOLE MODEL)
+    # STEP 3: WEIGHT TYING (AFTER FSDP/DDP, BEFORE COMPILE)
+    # Weight tying must be applied AFTER FSDP/DDP to avoid sharding issues.
+    # If applied before FSDP, the shared parameter would be processed twice:
+    # - Once when sharding tok_embeddings
+    # - Once when sharding output
+    # This could cause incorrect gradient computation or memory issues.
+    #
+    # Weight tying must be applied BEFORE torch.compile because GPT-2 uses
+    # whole-model compilation. If applied after compile, the compiled graph
+    # would have captured the original output.weight tensor, not the tied one.
+    #
+    # By applying weight tying after FSDP but before compile:
+    # - Both tok_embeddings.weight and output.weight are already DTensors
+    # - Assigning one to the other makes them share the same DTensor
+    # - The compiled graph will see the tied weights from the start
+    # - The optimizer (built after this) sees only one copy of the parameter
+    #
+    # NOTE: Qwen3 uses per-layer compilation (which doesn't compile output),
+    # so it applies weight tying after compile. GPT-2 uses whole-model
+    # compilation, so weight tying must happen before compile.
+    # =========================================================================
+    if model.model_args.weight_tying:
+        model.output.weight = model.tok_embeddings.weight
+        logger.info(
+            "Applied weight tying: output.weight now shares tok_embeddings.weight"
+        )
+
+    # =========================================================================
+    # STEP 4: TORCH.COMPILE (WHOLE MODEL)
     # Compiles the entire model including forward + loss computation.
     # This enables fusion of output projection with cross-entropy loss.
+    # Must happen AFTER weight tying so the compiled graph sees tied weights.
     # =========================================================================
     if model_compile_enabled:
         model = apply_compile(model, job_config.compile)

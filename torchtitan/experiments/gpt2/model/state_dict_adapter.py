@@ -64,6 +64,11 @@ class GPT2StateDictAdapter(StateDictAdapter):
             if key.startswith("model."):
                 key = key[6:]
 
+            # Skip output.weight when weight tying is enabled - it's the same
+            # tensor as tok_embeddings.weight, so saving it would be redundant
+            if self.model_args.weight_tying and key == "output.weight":
+                continue
+
             # Convert key names
             new_key = self._tt_to_hf_key(key)
             if new_key is not None:
@@ -80,6 +85,16 @@ class GPT2StateDictAdapter(StateDictAdapter):
         Returns:
             TorchTitan state dict with 'model.' prefix
         """
+        # Handle weight tying: if lm_head.weight is missing but weight_tying
+        # is enabled, use wte.weight for both
+        if (
+            self.model_args.weight_tying
+            and "lm_head.weight" not in hf_state_dict
+            and "wte.weight" in hf_state_dict
+        ):
+            hf_state_dict = dict(hf_state_dict)  # Make a copy to avoid modifying original
+            hf_state_dict["lm_head.weight"] = hf_state_dict["wte.weight"]
+
         state_dict = {}
 
         for key, value in hf_state_dict.items():

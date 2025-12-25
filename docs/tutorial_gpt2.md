@@ -270,16 +270,40 @@ def parallelize_gpt2(model, parallel_dims, job_config):
     if job_config.activation_checkpoint.mode != "none":
         apply_ac(model, job_config.activation_checkpoint, ...)
 
-    # Step 2: torch.compile (optimizes computation)
-    if model_compile_enabled:
-        apply_compile(model, job_config.compile)
-
-    # Step 3: Data Parallelism
+    # Step 2: Data Parallelism (FSDP or DDP)
     if parallel_dims.fsdp_enabled:
         apply_fsdp(model, dp_mesh, ...)
     elif parallel_dims.dp_replicate_enabled:
         apply_ddp(model, dp_mesh, ...)
+
+    # Step 3: Weight Tying (after FSDP, before compile)
+    if model.model_args.weight_tying:
+        model.output.weight = model.tok_embeddings.weight
+
+    # Step 4: torch.compile (whole model, sees tied weights)
+    if model_compile_enabled:
+        apply_compile(model, job_config.compile)
 ```
+
+**Why weight tying order matters:**
+
+Weight tying must be applied:
+1. **After FSDP/DDP**: If applied before, the shared parameter would be sharded
+   twice (once for `tok_embeddings`, once for `output`), causing issues.
+
+2. **Before torch.compile**: GPT-2 uses whole-model compilation (including the
+   output layer). If weight tying happens after compile, the compiled graph would
+   have captured the original `output.weight` tensor, not the tied one.
+
+By applying weight tying after FSDP but before compile:
+- Both parameters are already DTensors with sharding information
+- Assigning one to the other makes them share the same DTensor
+- The compiled graph sees the tied weights from the start
+- The optimizer (built after parallelization) sees only one copy
+
+**Note**: Qwen3 uses per-layer compilation (which doesn't compile the output
+layer), so it applies weight tying after compile. GPT-2's whole-model compilation
+requires weight tying before compile.
 
 ### 3.4 TrainSpec (`__init__.py`)
 
