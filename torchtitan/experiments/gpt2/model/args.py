@@ -7,7 +7,7 @@ GPT-2 differs from Llama in several ways:
 - Uses learned positional embeddings (not RoPE)
 - Uses GELU activation (not SwiGLU)
 - Uses LayerNorm (not RMSNorm)
-- Uses weight tying between embeddings and output
+- Optionally supports weight tying between embeddings and output
 """
 
 from dataclasses import dataclass
@@ -53,8 +53,9 @@ class GPT2ModelArgs(BaseModelArgs):
     norm_eps: float = 1e-5
     """Epsilon for LayerNorm."""
 
-    weight_tying: bool = True
-    """Whether to tie embedding and output weights (GPT-2 does this)."""
+    weight_tying: bool = False
+    """Whether to tie embedding and output weights. Disabled by default to
+    avoid complexity with FSDP sharding. Enable for smaller memory footprint."""
 
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
         """Update model args from job config."""

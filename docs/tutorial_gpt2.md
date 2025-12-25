@@ -218,7 +218,7 @@ class GPT2ModelArgs(BaseModelArgs):
     max_seq_len: int = 1024  # Context window
     dropout: float = 0.0     # Dropout (0 for pretraining)
     bias: bool = True        # Use bias in linear layers
-    weight_tying: bool = True  # Tie embedding and output weights
+    weight_tying: bool = False  # Optionally tie embedding and output weights
 ```
 
 The `BaseModelArgs` requires two methods:
@@ -255,7 +255,7 @@ Key differences from Llama:
 - **Learned positional embeddings** (not RoPE)
 - **GELU activation** (not SwiGLU)
 - **LayerNorm** (not RMSNorm)
-- **Weight tying** between embeddings and output
+- **Optional weight tying** between embeddings and output (disabled by default)
 
 ### 3.3 Parallelization (`infra/parallelize.py`)
 
