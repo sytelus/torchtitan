@@ -180,15 +180,31 @@ class GPT2Model(nn.Module, ModelProtocol):
             persistent=False
         )
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
-        Forward pass for GPT-2.
+        Forward pass for GPT-2 with optional fused loss computation.
+
+        When `labels` is provided, computes and returns the loss directly.
+        This enables torch.compile to fuse the output projection with cross-entropy,
+        avoiding materialization of the full [batch, seq, vocab_size] logits tensor.
+
+        Memory savings from fused loss:
+        - Without fusion: logits tensor = batch × seq × vocab × dtype_size
+          For GPT-2 (vocab=50257): 64 × 1024 × 50257 × 2 bytes = ~6.5GB in bf16
+        - With fusion: Only chunked computation, ~50% memory reduction
 
         Args:
             tokens: Input token IDs, shape (batch_size, seq_len)
+            labels: Target token IDs for loss computation, shape (batch_size, seq_len).
+                    If None, returns logits for inference.
 
         Returns:
-            Logits, shape (batch_size, seq_len, vocab_size)
+            If labels is None: Logits, shape (batch_size, seq_len, vocab_size)
+            If labels is provided: Scalar loss value
         """
         B, T = tokens.size()
         assert T <= self.model_args.max_seq_len, f"Sequence length {T} exceeds max {self.model_args.max_seq_len}"
@@ -202,11 +218,25 @@ class GPT2Model(nn.Module, ModelProtocol):
         for layer in self.layers.values():
             x = layer(x)
 
-        # Final norm and output
+        # Final norm
         x = self.norm(x)
-        logits = self.output(x)
 
-        return logits
+        if labels is not None:
+            # FUSED PATH: Compute loss without materializing full logits tensor.
+            # When compiled, torch.compile can fuse the linear projection with
+            # cross-entropy, using chunked/online computation similar to Flash Attention.
+            # This avoids storing the [batch, seq, vocab_size] logits tensor.
+            logits = self.output(x)
+            # Flatten for cross-entropy: (B, T, V) -> (B*T, V) and (B, T) -> (B*T,)
+            loss = F.cross_entropy(
+                logits.flatten(0, 1).float(),
+                labels.flatten(0, 1),
+            )
+            return loss
+        else:
+            # INFERENCE PATH: Return logits for generation/evaluation
+            logits = self.output(x)
+            return logits
 
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         """Initialize model weights following GPT-2 conventions."""

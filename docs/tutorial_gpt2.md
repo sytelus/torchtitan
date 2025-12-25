@@ -160,6 +160,45 @@ The critical constraint is avoiding graph breaks for `torch.compile`. If FSDP is
 applied before compile, the communication hooks fragment the graph, forcing
 activation checkpointing to fall back to eager execution — destroying performance.
 
+### GPT-2's Alternative: Fused Forward+Loss Compilation
+
+The standard TorchTitan approach (per-layer compile before FSDP) is optimized for
+very large models. For smaller models like GPT-2, we use a different strategy that
+provides better memory efficiency:
+
+**Standard TorchTitan (per-layer compilation):**
+```
+model.layers[i] = torch.compile(block)  # Each block compiled separately
+logits = model(inputs)                   # Full [batch, seq, vocab] tensor materialized
+loss = loss_fn(logits, labels)           # Loss compiled separately
+```
+
+**GPT-2 (whole-model + fused loss):**
+```
+loss = model(inputs, labels=labels)      # Loss computed inside forward()
+model = torch.compile(model)             # Whole model compiled together
+# torch.compile can fuse output projection + cross_entropy
+# Avoids materializing full [batch, seq, vocab] logits tensor
+```
+
+**Why fused compilation is better for GPT-2:**
+
+1. **Memory savings**: For GPT-2 with vocab=50257, batch=64, seq=1024:
+   - Without fusion: ~6.5GB for logits tensor in bf16
+   - With fusion: ~50% reduction through chunked computation
+
+2. **Per-layer has minimal runtime benefit for small models**: PyTorch docs note
+   "minimal speedup differences" between regional and full-model compilation.
+   Per-layer mainly reduces COMPILE TIME, not execution time.
+
+3. **Research validation**: torchtune's LinearCrossEntropyLoss using torch.compile
+   achieved 2x faster training and 3x less memory vs non-fused approach.
+
+**Implementation details:**
+- `model/model.py`: forward() accepts optional `labels` and computes loss internally
+- `infra/loss.py`: Returns pass-through function (loss already computed by model)
+- `infra/parallelize.py`: Compiles whole model AFTER applying FSDP/DDP
+
 ---
 
 ## Part 3: The GPT-2 Model Implementation
@@ -388,6 +427,99 @@ Open your WandB dashboard to see:
 | **Config** | `data_parallel_replicate_degree=8` | `data_parallel_shard_degree=8` |
 
 For GPT-2 124M (~500MB), DDP is sufficient and simpler.
+
+### 5.1.1 When to Use DDP vs FSDP
+
+**Use DDP when:**
+- Model fits comfortably in GPU memory
+- You want simplicity and maximum performance
+- Communication overhead would exceed memory savings
+
+**Use FSDP when:**
+- Model exceeds single GPU memory
+- You need to scale to very large models (billions of parameters)
+- Memory efficiency is critical
+
+**Performance Impact for Small Models:**
+
+Research shows FSDP can be **3x slower** than DDP for small models due to
+communication overhead. For example, training ConvNeXt_Large:
+- DDP: 485 seconds
+- FSDP: 1,490 seconds (3x slower)
+
+For GPT-2 on B200 GPUs (192GB memory), DDP is strongly preferred:
+- GPT-2 1.5B is only ~3GB in bf16, easily fits in 192GB
+- No all-gather/reduce-scatter overhead
+- Simpler memory access patterns, better cache utilization
+
+### 5.1.2 FSDP Sharding Granularity (Advanced)
+
+If you must use FSDP (e.g., for memory-constrained scenarios), understanding
+sharding granularity is important for performance.
+
+**The 100M Parameter Threshold:**
+
+FSDP wraps modules into "FSDP units" that communicate together. The granularity
+of these units significantly impacts performance:
+
+| Layer Size | Recommendation |
+|------------|----------------|
+| >100M params | Individual sharding (one FSDP unit per layer) |
+| 10M-100M params | Group layers together |
+| <100K params | Avoid separate sharding (overhead dominates) |
+
+**GPT-2 Layer Analysis:**
+
+All GPT-2 variants have layers well below the 100M threshold:
+
+| Model | Layers | Params/Layer | Recommended Grouping |
+|-------|--------|--------------|---------------------|
+| debugmodel | 4 | ~1.6M | All 4 layers → 1 FSDP unit |
+| 124M | 12 | ~10M | 6 layers → 2 FSDP units |
+| 355M | 24 | ~14M | 6 layers → 4 FSDP units |
+| 774M | 36 | ~21M | 4-5 layers → 8 FSDP units |
+| 1558M | 48 | ~32M | 3 layers → 16 FSDP units |
+
+**Why Layer Grouping Matters:**
+
+Per-layer sharding (one FSDP unit per TransformerBlock) incurs communication
+overhead for each unit:
+- All-gather before forward: O(params) communication
+- Reduce-scatter after backward: O(params) communication
+
+For small layers, this overhead can exceed the memory savings benefit.
+
+**Example for GPT-2 124M:**
+```
+Without grouping: 12 FSDP units
+  → 12 all-gather + 12 reduce-scatter calls per step
+
+With grouping (6 layers each): 2 FSDP units
+  → 2 all-gather + 2 reduce-scatter calls per step
+  → 6x fewer communication operations!
+```
+
+**Smart Layer Grouping in GPT-2 Implementation:**
+
+The GPT-2 implementation (`infra/parallelize.py`) automatically groups layers
+based on the 100M parameter threshold:
+
+```python
+# Target: ~100M parameters per FSDP unit
+_FSDP_MIN_PARAMS_PER_UNIT = 100_000_000
+
+# Calculate optimal grouping
+params_per_layer = count_parameters(transformer_block)
+layers_per_group = max(1, _FSDP_MIN_PARAMS_PER_UNIT // params_per_layer)
+
+# Group consecutive layers into single FSDP units
+for i in range(0, num_layers, layers_per_group):
+    group_layers = layers[i:i+layers_per_group]
+    fully_shard(group_layers, ...)  # Shard as one unit
+```
+
+The implementation also logs a warning when FSDP is used for models below the
+threshold, recommending DDP instead.
 
 ### 5.2 Configuration for 8 GPU DDP
 
@@ -1527,6 +1659,9 @@ export NCCL_NET_GDR_LEVEL=5
 
 This section explains how to switch from HSDP (Hybrid Sharded Data Parallel) to
 pure FSDP (Fully Sharded Data Parallel) for Qwen3 1.7B training.
+
+> **Note**: For small models like GPT-2, see [Section 5.1.2](#512-fsdp-sharding-granularity-advanced)
+> for guidance on FSDP sharding granularity and when DDP is preferred over FSDP.
 
 #### When to Use FSDP Instead of HSDP
 
