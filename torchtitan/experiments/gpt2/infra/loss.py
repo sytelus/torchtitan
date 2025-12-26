@@ -73,6 +73,21 @@ def fused_cross_entropy_loss(
     )
 
 
+# Signal to the trainer that this loss expects labels to be passed into model.forward().
+# When set, the trainer will include labels in the forward() call, enabling the model
+# to compute loss internally. This allows torch.compile to fuse output projection
+# with cross-entropy, avoiding full logits materialization.
+#
+# How it works:
+#   1. Trainer sees `loss_fn.requires_labels_in_forward = True`
+#   2. Trainer calls `model(inputs, labels=labels)` instead of `model(inputs)`
+#   3. Model computes loss inside forward() and returns `(logits, loss)`
+#   4. This loss function extracts the pre-computed loss from the tuple
+#
+# See: torchtitan/train.py (training path) and components/validate.py (validation path)
+fused_cross_entropy_loss.requires_labels_in_forward = True
+
+
 def build_fused_cross_entropy_loss(job_config: JobConfig, **kwargs):
     """
     Build a loss function for GPT-2 with fused forward+loss support.

@@ -88,6 +88,8 @@ torchtitan/
    `model_args` in `__init__()`.
 
 3. **Parallelization Order**: TP → AC → compile → FSDP/DDP (order matters!)
+   - **GPT-2 exception**: For fused forward+loss, GPT-2 compiles *after* FSDP/DDP.
+     See Part 3.3 for details.
 
 ### Why Parallelization Order Matters
 
@@ -160,6 +162,11 @@ The critical constraint is avoiding graph breaks for `torch.compile`. If FSDP is
 applied before compile, the communication hooks fragment the graph, forcing
 activation checkpointing to fall back to eager execution — destroying performance.
 
+**GPT-2 note:** In this tutorial, GPT-2 compiles after FSDP/DDP to enable fused
+output projection + loss. `torch.compile` will still optimize subgraphs around
+the communication hooks, and the fusion benefits outweigh the graph breaks for
+small models.
+
 ### GPT-2's Alternative: Fused Forward+Loss Compilation
 
 The standard TorchTitan approach (per-layer compile before FSDP) is optimized for
@@ -198,6 +205,7 @@ model = torch.compile(model)                  # Whole model compiled together
 - `model/model.py`: forward() returns `(logits, loss)` tuple; loss is computed if labels provided
 - `infra/loss.py`: Extracts loss from tuple, or computes from logits if loss is None
 - `infra/parallelize.py`: Compiles whole model AFTER applying FSDP/DDP
+- `train.py` / `components/validate.py`: Pass `labels` into `model.forward()` when fused loss is enabled
 
 ---
 
@@ -246,7 +254,7 @@ Token Embeddings + Positional Embeddings (learned)
     ↓
 LayerNorm
     ↓
-Output Projection (weight-tied with embeddings)
+Output Projection (optionally weight-tied with embeddings)
     ↓
 Logits
 ```
@@ -340,7 +348,8 @@ Install tiktoken for fast, lightweight tokenization with no downloads required:
 pip install tiktoken
 ```
 
-That's it! The GPT-2 experiment will automatically use tiktoken's `gpt2` encoding.
+That's it! The GPT-2 experiment will automatically use tiktoken's `gpt2` encoding
+unless you explicitly set `model.hf_assets_path`.
 
 **Option B: Use HuggingFace Tokenizer**
 
@@ -771,7 +780,7 @@ Update your training config to save checkpoints in HuggingFace format:
 
 ```toml
 [checkpoint]
-enable_checkpoint = true
+enable = true
 folder = "./outputs/gpt2_124m"
 interval = 1000  # Save every 1000 steps
 
@@ -784,7 +793,7 @@ Or pass via command line:
 ```bash
 NGPU=1 CONFIG_FILE="./torchtitan/experiments/gpt2/train_configs/debug_model.toml" \
     ./run_train.sh \
-    --checkpoint.enable_checkpoint \
+    --checkpoint.enable \
     --checkpoint.folder "./outputs/gpt2_debug" \
     --checkpoint.interval 500 \
     --checkpoint.last_save_in_hf

@@ -7,7 +7,7 @@ A simple GPT-2 implementation for learning TorchTitan basics.
 This experiment provides a clean GPT-2 implementation that demonstrates:
 - How to add a new model to TorchTitan
 - Single GPU training without parallelism
-- Multi-GPU training with DDP (no FSDP)
+- Multi-GPU training with DDP (and optional FSDP)
 - Integration with HuggingFace datasets
 
 ## Supported Model Sizes
@@ -23,6 +23,9 @@ This experiment provides a clean GPT-2 implementation that demonstrates:
 ## Quick Start
 
 ### 1. Download GPT-2 Tokenizer
+
+If you have `tiktoken` installed, you can skip this step and use the default
+tokenizer (no downloads required).
 
 ```bash
 python scripts/download_hf_assets.py \
@@ -64,5 +67,5 @@ For advanced parallelism, see the Llama3 model implementation.
 | Positional Encoding | Learned | RoPE |
 | Activation | GELU | SwiGLU |
 | Normalization | LayerNorm | RMSNorm |
-| Weight Tying | Yes | No |
+| Weight Tying | Optional | No |
 | GQA | No | Yes |

@@ -163,7 +163,15 @@ class Validator(BaseValidator):
                 with self.validation_context(optional_context_parallel_ctx):
                     assert len(model_parts) == 1
                     with self.maybe_enable_amp:
-                        predictions = model_parts[0](inputs)
+                        # Fused forward+loss support: When the loss function has
+                        # `requires_labels_in_forward = True`, pass labels into
+                        # model.forward() so the model can compute loss internally.
+                        # This mirrors the training path and enables fused loss
+                        # computation for memory efficiency. See train.py for details.
+                        if getattr(self.loss_fn, "requires_labels_in_forward", False):
+                            predictions = model_parts[0](inputs, labels=labels)
+                        else:
+                            predictions = model_parts[0](inputs)
                         loss = self.loss_fn(predictions, labels)
 
             accumulated_losses.append(loss.detach())

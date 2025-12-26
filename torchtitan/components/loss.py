@@ -48,6 +48,25 @@ class RescaleAccumulatedLoss:
             return loss
         return loss / self.accumulation_steps
 
+    @property
+    def requires_labels_in_forward(self) -> bool:
+        """
+        Whether the wrapped loss expects labels to be passed into model.forward().
+
+        This property propagates the `requires_labels_in_forward` flag from the
+        underlying loss function through the wrapper. This is necessary because:
+
+        1. The trainer checks `loss_fn.requires_labels_in_forward` to decide
+           whether to pass labels into model.forward() for fused loss computation.
+        2. Loss functions are wrapped by RescaleAccumulatedLoss for gradient
+           accumulation, which would otherwise hide the flag.
+        3. Without this property, fused forward+loss would silently fail to
+           activate after wrapping.
+
+        See train.py and experiments/gpt2/infra/loss.py for the full pattern.
+        """
+        return getattr(self.unwrapped_loss_fn, "requires_labels_in_forward", False)
+
     @contextlib.contextmanager
     def no_rescale(self):
         """Context manager for disabling rescaling"""

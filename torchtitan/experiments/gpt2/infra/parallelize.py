@@ -11,17 +11,21 @@ For simplicity, this implementation supports:
 Tensor Parallelism (TP) is not implemented for GPT-2 in this tutorial,
 but the structure follows TorchTitan conventions for easy extension.
 
-ORDER OF PARALLELIZATION (must be followed strictly):
+ORDER OF PARALLELIZATION (GPT-2):
 1. Tensor Parallelism (TP) - if enabled (not implemented here)
 2. Activation Checkpointing (AC) - reduces memory
-3. torch.compile - optimizes computation
-4. FSDP/DDP - data parallelism
+3. FSDP/DDP - data parallelism
+4. Weight tying (if enabled)
+5. torch.compile - whole-model optimization
+
+Note: TorchTitan's standard order for large models is TP -> AC -> compile -> FSDP/DDP.
+GPT-2 intentionally compiles AFTER data parallelism so the compiled graph can
+fuse the output projection with cross-entropy loss.
 
 COMPILATION STRATEGY:
 ---------------------
-This module follows TorchTitan's per-layer compilation pattern for consistency.
-However, research shows that WHOLE-MODEL compilation (including loss) can be
-superior for small models:
+This module uses WHOLE-MODEL compilation (including loss) after data parallelism
+because it can be superior for small models:
 
 1. FUSED OUTPUT + LOSS: Wrapping output projection + cross_entropy in a single
    torch.compile call enables fusion that avoids materializing the full
@@ -38,9 +42,8 @@ superior for small models:
 3. SMALL MODELS: For models with few layers (e.g., 4-layer debug), whole-model
    compilation may produce better code through cross-layer fusion.
 
-The current implementation uses per-layer for TorchTitan consistency, but
-for optimal performance on small models, consider whole-model compilation
-in the training loop (see train.py integration notes below).
+This implementation compiles the entire model (including loss) so torch.compile
+can fuse output projection + cross-entropy and avoid materializing full logits.
 
 CHOOSING BETWEEN DDP AND FSDP:
 - DDP (data_parallel_shard_degree=1, data_parallel_replicate_degree=N):
@@ -113,7 +116,7 @@ def parallelize_gpt2(
     Apply parallelism strategies to GPT-2 model.
 
     This function applies parallelism in the correct order:
-    AC -> compile -> FSDP/DDP
+    AC -> FSDP/DDP -> weight tying -> compile
 
     Args:
         model: The GPT-2 model (preferably on meta device)

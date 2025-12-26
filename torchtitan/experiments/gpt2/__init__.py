@@ -118,6 +118,9 @@ def build_gpt2_tokenizer(job_config: JobConfig) -> BaseTokenizer:
     """
     # Check if user explicitly specified HuggingFace assets path
     hf_assets_path = getattr(job_config.model, "hf_assets_path", None)
+    default_hf_assets_path = JobConfig().model.hf_assets_path
+    if hf_assets_path == default_hf_assets_path:
+        hf_assets_path = None
     use_hf = hf_assets_path is not None and hf_assets_path != ""
 
     if not use_hf:

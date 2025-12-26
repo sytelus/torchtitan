@@ -470,6 +470,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 extra_inputs=extra_inputs,
             )
 
+        # Fused forward+loss support: Some models (e.g., GPT-2) compute loss inside
+        # forward() when labels are provided. This enables torch.compile to fuse
+        # the output projection with cross-entropy loss, avoiding materialization
+        # of the full [batch, seq, vocab_size] logits tensor (~50% memory savings).
+        #
+        # The loss function opts in by setting `requires_labels_in_forward = True`.
+        # We pass labels via extra_kwargs so they reach model.forward().
+        #
+        # This is disabled for pipeline parallelism because PP handles labels
+        # separately via the schedule's `target` parameter, not through forward().
+        if not self.parallel_dims.pp_enabled and getattr(
+            self.loss_fn, "requires_labels_in_forward", False
+        ):
+            extra_kwargs["labels"] = labels
+
         return inputs, labels, extra_inputs, extra_kwargs
 
     def forward_backward_step(
