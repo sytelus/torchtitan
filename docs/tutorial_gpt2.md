@@ -175,8 +175,8 @@ loss = loss_fn(logits, labels)           # Loss compiled separately
 
 **GPT-2 (whole-model + fused loss):**
 ```
-loss = model(inputs, labels=labels)      # Loss computed inside forward()
-model = torch.compile(model)             # Whole model compiled together
+logits, loss = model(inputs, labels=labels)  # Returns tuple (logits, loss)
+model = torch.compile(model)                  # Whole model compiled together
 # torch.compile can fuse output projection + cross_entropy
 # Avoids materializing full [batch, seq, vocab] logits tensor
 ```
@@ -195,8 +195,8 @@ model = torch.compile(model)             # Whole model compiled together
    achieved 2x faster training and 3x less memory vs non-fused approach.
 
 **Implementation details:**
-- `model/model.py`: forward() accepts optional `labels` and computes loss internally
-- `infra/loss.py`: Returns pass-through function (loss already computed by model)
+- `model/model.py`: forward() returns `(logits, loss)` tuple; loss is computed if labels provided
+- `infra/loss.py`: Extracts loss from tuple, or computes from logits if loss is None
 - `infra/parallelize.py`: Compiles whole model AFTER applying FSDP/DDP
 
 ---
@@ -319,8 +319,8 @@ def get_train_spec() -> TrainSpec:
         build_optimizers_fn=build_optimizers,
         build_lr_schedulers_fn=build_lr_schedulers,
         build_dataloader_fn=build_text_dataloader,
-        build_tokenizer_fn=build_hf_tokenizer,
-        build_loss_fn=build_cross_entropy_loss,
+        build_tokenizer_fn=build_gpt2_tokenizer,  # Uses tiktoken by default
+        build_loss_fn=build_fused_cross_entropy_loss,
     )
 ```
 
@@ -328,7 +328,23 @@ def get_train_spec() -> TrainSpec:
 
 ## Part 4: Training on Single GPU with Shakespeare
 
-### 4.1 Download the GPT-2 Tokenizer
+### 4.1 Tokenizer Setup
+
+GPT-2 uses a BPE tokenizer with 50,257 tokens. You have two options:
+
+**Option A: Use tiktoken (Recommended)**
+
+Install tiktoken for fast, lightweight tokenization with no downloads required:
+
+```bash
+pip install tiktoken
+```
+
+That's it! The GPT-2 experiment will automatically use tiktoken's `gpt2` encoding.
+
+**Option B: Use HuggingFace Tokenizer**
+
+If you prefer HuggingFace tokenizers or don't have tiktoken installed:
 
 ```bash
 python scripts/download_hf_assets.py \
@@ -340,6 +356,11 @@ python scripts/download_hf_assets.py \
 This downloads:
 - `tokenizer.json` - The tokenizer definition
 - `tokenizer_config.json` - BOS/EOS token configuration
+
+Then set `hf_assets_path` in your config to use the HuggingFace tokenizer.
+
+**Note**: tiktoken is 3-6x faster than HuggingFace tokenizers and produces
+identical tokens for GPT-2.
 
 ### 4.2 Configuration File
 

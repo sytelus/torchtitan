@@ -9,6 +9,11 @@ It supports:
 - GPT-2 774M
 - GPT-2 1.5B
 
+TOKENIZER:
+By default, uses tiktoken's fast GPT-2 tokenizer (no download required).
+Falls back to HuggingFace tokenizer if tiktoken is not installed or if
+hf_assets_path is specified in the config.
+
 COMPILATION STRATEGY:
 This implementation uses WHOLE-MODEL compilation with FUSED FORWARD+LOSS:
 - The model computes loss inside forward() when labels are provided
@@ -25,9 +30,11 @@ Usage:
 
 from torchtitan.components.lr_scheduler import build_lr_schedulers
 from torchtitan.components.optimizer import build_optimizers
-from torchtitan.components.tokenizer import build_hf_tokenizer
+from torchtitan.components.tokenizer import BaseTokenizer, build_hf_tokenizer
+from torchtitan.config import JobConfig
 from torchtitan.hf_datasets.text_datasets import build_text_dataloader
 from torchtitan.protocols.train_spec import TrainSpec
+from torchtitan.tools.logging import logger
 
 from .infra.loss import build_fused_cross_entropy_loss
 from .infra.parallelize import parallelize_gpt2
@@ -41,6 +48,7 @@ __all__ = [
     "GPT2Model",
     "GPT2StateDictAdapter",
     "gpt2_configs",
+    "build_gpt2_tokenizer",
 ]
 
 
@@ -89,6 +97,54 @@ gpt2_configs = {
 }
 
 
+def build_gpt2_tokenizer(job_config: JobConfig) -> BaseTokenizer:
+    """
+    Build a tokenizer for GPT-2.
+
+    By default, uses tiktoken's fast GPT-2 tokenizer which:
+    - Requires no file downloads
+    - Is 3-6x faster than HuggingFace tokenizers
+    - Produces identical tokens to the original GPT-2 tokenizer
+
+    Falls back to HuggingFace tokenizer if:
+    - tiktoken is not installed
+    - hf_assets_path is explicitly specified in the config
+
+    Args:
+        job_config: Job configuration
+
+    Returns:
+        Tokenizer instance (TiktokenTokenizer or HuggingFaceTokenizer)
+    """
+    # Check if user explicitly specified HuggingFace assets path
+    hf_assets_path = getattr(job_config.model, "hf_assets_path", None)
+    use_hf = hf_assets_path is not None and hf_assets_path != ""
+
+    if not use_hf:
+        # Try to use tiktoken (preferred)
+        try:
+            from .tokenizer import build_tiktoken_tokenizer
+
+            logger.info("Using tiktoken GPT-2 tokenizer (fast, no download required)")
+            return build_tiktoken_tokenizer(job_config)
+        except ImportError:
+            logger.warning(
+                "tiktoken not installed, falling back to HuggingFace tokenizer. "
+                "Install tiktoken for faster tokenization: pip install tiktoken"
+            )
+            use_hf = True
+
+    if use_hf:
+        if not hf_assets_path:
+            raise ValueError(
+                "HuggingFace tokenizer requires hf_assets_path to be set in config. "
+                "Either install tiktoken (pip install tiktoken) or download GPT-2 "
+                "tokenizer files to a directory and set model.hf_assets_path in your config."
+            )
+        logger.info(f"Using HuggingFace tokenizer from {hf_assets_path}")
+        return build_hf_tokenizer(job_config)
+
+
 def get_train_spec() -> TrainSpec:
     """Return the TrainSpec for GPT-2 models.
 
@@ -96,6 +152,10 @@ def get_train_spec() -> TrainSpec:
     - The model computes loss inside forward() when labels are provided
     - Whole-model compilation enables output+cross_entropy fusion
     - The loss builder returns a pass-through function since loss is pre-computed
+
+    Tokenizer:
+    - Uses tiktoken by default (fast, no download required)
+    - Falls back to HuggingFace if tiktoken not installed or hf_assets_path is set
     """
     return TrainSpec(
         model_cls=GPT2Model,
@@ -105,7 +165,7 @@ def get_train_spec() -> TrainSpec:
         build_optimizers_fn=build_optimizers,
         build_lr_schedulers_fn=build_lr_schedulers,
         build_dataloader_fn=build_text_dataloader,
-        build_tokenizer_fn=build_hf_tokenizer,
+        build_tokenizer_fn=build_gpt2_tokenizer,  # Uses tiktoken by default
         build_loss_fn=build_fused_cross_entropy_loss,  # Fused loss for optimal compilation
         state_dict_adapter=GPT2StateDictAdapter,
     )

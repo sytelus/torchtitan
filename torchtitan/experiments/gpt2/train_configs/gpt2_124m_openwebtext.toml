@@ -24,8 +24,10 @@ enable_wandb = true
 [model]
 name = "gpt2"
 flavor = "124M"
-# Download GPT-2 tokenizer: python scripts/download_hf_assets.py --repo_id openai-community/gpt2 --assets tokenizer --local_dir ./assets/hf/gpt2
-hf_assets_path = "./assets/hf/gpt2"
+# Tokenizer: Uses tiktoken by default (pip install tiktoken), no download needed.
+# Uncomment below to use HuggingFace tokenizer instead:
+# hf_assets_path = "./assets/hf/gpt2"
+# Download HF tokenizer: python scripts/download_hf_assets.py --repo_id openai-community/gpt2 --assets tokenizer --local_dir ./assets/hf/gpt2
 
 [optimizer]
 name = "AdamW"

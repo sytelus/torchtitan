@@ -5,6 +5,12 @@ GPT-2 Fused Loss Function
 This module provides a loss function builder for GPT-2 that supports fused
 forward+loss computation when the model computes loss internally.
 
+GPT-2 MODEL RETURN FORMAT:
+--------------------------
+The GPT-2 model.forward() returns a tuple: (logits, loss)
+- logits: Always returned, shape (batch, seq, vocab)
+- loss: Scalar if labels were provided, else None
+
 FUSED vs SEPARATE LOSS COMPUTATION:
 -----------------------------------
 Traditional approach (TorchTitan default):
@@ -12,8 +18,8 @@ Traditional approach (TorchTitan default):
     loss = cross_entropy(logits, labels)  # Compiled separately
 
 Fused approach (this implementation):
-    loss = model(inputs, labels=labels)  # Loss computed inside forward
-    return loss  # Pass-through, loss already computed
+    logits, loss = model(inputs, labels=labels)  # Loss computed inside forward
+    return loss  # Use pre-computed loss
 
 The fused approach enables torch.compile to optimize the output projection
 and cross-entropy together, potentially using chunked computation to avoid
@@ -34,32 +40,36 @@ from torchtitan.config import JobConfig
 from torchtitan.tools.logging import logger
 
 
-def fused_cross_entropy_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+def fused_cross_entropy_loss(
+    pred: tuple[torch.Tensor, torch.Tensor | None],
+    labels: torch.Tensor,
+) -> torch.Tensor:
     """
     Loss function for fused forward+loss computation.
 
-    When the model computes loss internally (pred is already a scalar loss),
-    this function simply returns it. When the model returns logits (inference
-    mode or non-fused path), this computes cross-entropy normally.
+    The GPT-2 model returns (logits, loss) tuple. If loss was computed inside
+    the model (labels were provided), we use that. Otherwise, we compute
+    cross-entropy from the logits.
 
     Args:
-        pred: Either:
-            - Scalar loss tensor (fused path, model computed loss)
-            - Logits tensor of shape (batch, seq, vocab) (inference path)
+        pred: Tuple of (logits, loss) from model.forward():
+            - logits: Shape (batch, seq, vocab)
+            - loss: Scalar if labels provided to forward(), else None
         labels: Target token IDs of shape (batch, seq)
 
     Returns:
         Scalar loss tensor
     """
-    # Check if pred is already a scalar loss (fused path)
-    if pred.dim() == 0 or (pred.dim() == 1 and pred.numel() == 1):
-        # Model already computed the loss, just return it
-        return pred.squeeze()
+    logits, loss = pred
 
-    # Fallback: pred is logits, compute cross-entropy
+    # If model already computed the loss, use it
+    if loss is not None:
+        return loss
+
+    # Fallback: compute cross-entropy from logits
     # This path is used for inference/validation or if forward wasn't called with labels
     return torch.nn.functional.cross_entropy(
-        pred.flatten(0, 1).float(), labels.flatten(0, 1)
+        logits.flatten(0, 1).float(), labels.flatten(0, 1)
     )
 
 
@@ -75,16 +85,16 @@ def build_fused_cross_entropy_loss(job_config: JobConfig, **kwargs):
     2. Avoidance of full logits tensor materialization
     3. Better memory efficiency for large vocabulary models
 
-    The returned function handles both:
-    - Fused path: pred is already the loss (pass-through)
-    - Inference path: pred is logits (compute cross-entropy)
+    The returned function handles:
+    - Fused path: loss from model tuple is used directly
+    - Fallback path: compute cross-entropy from logits if loss is None
 
     Args:
         job_config: Job configuration (used for consistency with TorchTitan API)
         **kwargs: Additional arguments (ignored)
 
     Returns:
-        Loss function that handles both fused and non-fused cases
+        Loss function that handles GPT-2's (logits, loss) tuple output
     """
     del kwargs  # Unused, but kept for API compatibility
 
