@@ -31,6 +31,25 @@ def _process_c4_text(sample: dict[str, Any]) -> str:
     """Process C4 dataset sample text."""
     return sample["text"]
 
+def _load_tiny_shakespeare_dataset(dataset_path: str, split: str):
+    """Load tiny_shakespeare from raw text and split 90/10."""
+    text_url = (
+        "https://raw.githubusercontent.com/karpathy/char-rnn/"
+        "master/data/tinyshakespeare/input.txt"
+    )
+    full_ds = load_dataset("text", data_files=text_url, split="train")
+    split_ds = full_ds.train_test_split(test_size=0.1, seed=1337, shuffle=True)
+    if split == "train":
+        return split_ds["train"]
+    if split == "validation":
+        return split_ds["test"]
+    raise ValueError(f"Unsupported split for tiny_shakespeare: {split}")
+
+
+def _process_shakespeare_text(sample: dict[str, Any]) -> str:
+    """Process tiny_shakespeare dataset sample text."""
+    return sample["text"]
+
 
 # Add your dataset here - more information at docs/datasets.md
 DATASETS = {
@@ -48,6 +67,16 @@ DATASETS = {
         path="allenai/c4",
         loader=partial(_load_c4_dataset, split="validation"),
         sample_processor=_process_c4_text,
+    ),
+    "tiny_shakespeare": DatasetConfig(
+        path="karpathy/tiny_shakespeare",
+        loader=partial(_load_tiny_shakespeare_dataset, split="train"),
+        sample_processor=_process_shakespeare_text,
+    ),
+    "tiny_shakespeare_validation": DatasetConfig(
+        path="karpathy/tiny_shakespeare",
+        loader=partial(_load_tiny_shakespeare_dataset, split="validation"),
+        sample_processor=_process_shakespeare_text,
     ),
 }
 

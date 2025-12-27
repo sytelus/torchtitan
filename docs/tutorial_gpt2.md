@@ -277,21 +277,26 @@ registered, training will fail with:
 ValueError: Dataset tiny_shakespeare is not supported.
 ```
 
-**Step 1: Register the dataset (one-time code change)**
+**Step 1: Confirm the dataset is registered**
 
-Add the tiny_shakespeare entry in `torchtitan/hf_datasets/text_datasets.py`:
+TorchTitan registers `tiny_shakespeare` and a 90/10 split in
+`torchtitan/hf_datasets/text_datasets.py`. If you're on an older commit, add
+the entry below:
 
 ```python
-from huggingface_hub import hf_hub_download
-
-def _load_tiny_shakespeare(dataset_path: str):
+def _load_tiny_shakespeare_dataset(dataset_path: str, split: str):
     # HF datasets no longer supports dataset scripts, so load the raw file.
-    text_file = hf_hub_download(
-        repo_id=dataset_path,
-        filename="input.txt",
-        repo_type="dataset",
+    text_url = (
+        "https://raw.githubusercontent.com/karpathy/char-rnn/"
+        "master/data/tinyshakespeare/input.txt"
     )
-    return load_dataset("text", data_files=text_file, split="train", streaming=True)
+    full_ds = load_dataset("text", data_files=text_url, split="train")
+    split_ds = full_ds.train_test_split(test_size=0.1, seed=1337, shuffle=True)
+    if split == "train":
+        return split_ds["train"]
+    if split == "validation":
+        return split_ds["test"]
+    raise ValueError(f"Unsupported split for tiny_shakespeare: {split}")
 
 def _process_shakespeare_text(sample: dict[str, Any]) -> str:
     return sample["text"]
@@ -300,7 +305,12 @@ DATASETS = {
     # ... existing entries ...
     "tiny_shakespeare": DatasetConfig(
         path="karpathy/tiny_shakespeare",
-        loader=_load_tiny_shakespeare,
+        loader=partial(_load_tiny_shakespeare_dataset, split="train"),
+        sample_processor=_process_shakespeare_text,
+    ),
+    "tiny_shakespeare_validation": DatasetConfig(
+        path="karpathy/tiny_shakespeare",
+        loader=partial(_load_tiny_shakespeare_dataset, split="validation"),
         sample_processor=_process_shakespeare_text,
     ),
 }
@@ -308,19 +318,18 @@ DATASETS = {
 
 **Step 2: (Optional) Pre-download/cache the dataset**
 
-Streaming loaders fetch on demand, but you can pre-cache:
+The tiny_shakespeare loader is non-streaming to enable a deterministic 90/10
+split. The dataset is small, so this is OK. You can still pre-cache:
 
 ```bash
 python - <<'PY'
-from huggingface_hub import hf_hub_download
 from datasets import load_dataset
 
-text_file = hf_hub_download(
-    repo_id="karpathy/tiny_shakespeare",
-    filename="input.txt",
-    repo_type="dataset",
+text_url = (
+    "https://raw.githubusercontent.com/karpathy/char-rnn/"
+    "master/data/tinyshakespeare/input.txt"
 )
-load_dataset("text", data_files=text_file, split="train")
+load_dataset("text", data_files=text_url, split="train")
 PY
 ```
 
@@ -357,6 +366,18 @@ data_parallel_replicate_degree = 1
 data_parallel_shard_degree = 1
 tensor_parallel_degree = 1
 pipeline_parallel_degree = 1
+```
+
+Optional: enable validation on the 10% split:
+
+```toml
+[validation]
+enable = true
+dataset = "tiny_shakespeare_validation"
+local_batch_size = 64
+seq_len = 256
+freq = 200
+steps = 50
 ```
 
 ### 4.4 Enable WandB Logging
@@ -625,8 +646,21 @@ DATASETS = {
         loader=partial(_load_c4_dataset, split="validation"),
         sample_processor=_process_c4_text,
     ),
+    "tiny_shakespeare": DatasetConfig(
+        path="karpathy/tiny_shakespeare",
+        loader=partial(_load_tiny_shakespeare_dataset, split="train"),
+        sample_processor=_process_shakespeare_text,
+    ),
+    "tiny_shakespeare_validation": DatasetConfig(
+        path="karpathy/tiny_shakespeare",
+        loader=partial(_load_tiny_shakespeare_dataset, split="validation"),
+        sample_processor=_process_shakespeare_text,
+    ),
 }
 ```
+
+Note: `tiny_shakespeare` uses a non-streaming loader to create a deterministic
+90/10 train/validation split.
 
 ### 6.2 Adding a Custom Dataset
 
@@ -720,7 +754,8 @@ ValueError: Dataset tiny_shakespeare is not supported.
 ```
 
 Register the dataset in `torchtitan/hf_datasets/text_datasets.py` (see Part 4.2)
-or switch to one of the built-in datasets (`c4`, `c4_test`, `c4_validation`).
+or switch to one of the built-in datasets (`c4`, `c4_test`, `c4_validation`,
+`tiny_shakespeare`, `tiny_shakespeare_validation`).
 
 ---
 
