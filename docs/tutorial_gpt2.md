@@ -266,7 +266,72 @@ Then set `hf_assets_path` in your config to use the HuggingFace tokenizer.
 **Note**: tiktoken is 3-6x faster than HuggingFace tokenizers and produces
 identical tokens for GPT-2.
 
-### 4.2 Configuration File
+### 4.2 Dataset Setup (tiny_shakespeare)
+
+Before training, make sure the dataset is registered and cached. TorchTitan
+validates `training.dataset` against the `DATASETS` registry in
+`torchtitan/hf_datasets/text_datasets.py`. If `tiny_shakespeare` is not
+registered, training will fail with:
+
+```
+ValueError: Dataset tiny_shakespeare is not supported.
+```
+
+**Step 1: Register the dataset (one-time code change)**
+
+Add the tiny_shakespeare entry in `torchtitan/hf_datasets/text_datasets.py`:
+
+```python
+from huggingface_hub import hf_hub_download
+
+def _load_tiny_shakespeare(dataset_path: str):
+    # HF datasets no longer supports dataset scripts, so load the raw file.
+    text_file = hf_hub_download(
+        repo_id=dataset_path,
+        filename="input.txt",
+        repo_type="dataset",
+    )
+    return load_dataset("text", data_files=text_file, split="train", streaming=True)
+
+def _process_shakespeare_text(sample: dict[str, Any]) -> str:
+    return sample["text"]
+
+DATASETS = {
+    # ... existing entries ...
+    "tiny_shakespeare": DatasetConfig(
+        path="karpathy/tiny_shakespeare",
+        loader=_load_tiny_shakespeare,
+        sample_processor=_process_shakespeare_text,
+    ),
+}
+```
+
+**Step 2: (Optional) Pre-download/cache the dataset**
+
+Streaming loaders fetch on demand, but you can pre-cache:
+
+```bash
+python - <<'PY'
+from huggingface_hub import hf_hub_download
+from datasets import load_dataset
+
+text_file = hf_hub_download(
+    repo_id="karpathy/tiny_shakespeare",
+    filename="input.txt",
+    repo_type="dataset",
+)
+load_dataset("text", data_files=text_file, split="train")
+PY
+```
+
+**Step 3: Verify cache locations**
+
+```bash
+export HF_HOME="$HOME/misc_caches/hf_home"
+export HF_DATASETS_CACHE="$HOME/misc_caches/datasets"
+```
+
+### 4.3 Configuration File
 
 The tiny configuration (`torchtitan/experiments/gpt2/train_configs/debug_model.toml`):
 
@@ -294,7 +359,7 @@ tensor_parallel_degree = 1
 pipeline_parallel_degree = 1
 ```
 
-### 4.3 Enable WandB Logging
+### 4.4 Enable WandB Logging
 
 WandB is enabled in the config by default:
 
@@ -337,7 +402,7 @@ export WANDB_RUN_NOTES="Testing GPT-2 training"  # Run description
 
 **Tip:** Add these to your `.bashrc` or Slurm job script for persistent configuration.
 
-### 4.4 Run Training
+### 4.5 Run Training
 
 ```bash
 NGPU=1 CONFIG_FILE="./torchtitan/experiments/gpt2/train_configs/debug_model.toml" ./run_train.sh
@@ -354,7 +419,7 @@ Expected output:
 ...
 ```
 
-### 4.5 View Metrics in WandB
+### 4.6 View Metrics in WandB
 
 Open your WandB dashboard to see:
 - Training loss curve
@@ -482,7 +547,8 @@ flavor = "124M"
 name = "AdamW"
 lr = 18e-4
 weight_decay = 0.1
-betas = [0.9, 0.95]
+beta1 = 0.9
+beta2 = 0.95
 
 [lr_scheduler]
 warmup_steps = 256
@@ -535,23 +601,29 @@ With 8 B200 GPUs and the nanuGPT-style configuration:
 
 ---
 
-## Part 6: Adding Your Own Dataset
+## Part 6: Optional — Add Another Dataset
 
-### 6.1 Dataset Configuration
+### 6.1 Dataset Configuration (Overview)
 
-Datasets are defined in `torchtitan/hf_datasets/text_datasets.py`:
+Datasets are registered in `torchtitan/hf_datasets/text_datasets.py`. The
+`training.dataset` name must exist in the `DATASETS` dict (case-insensitive).
 
 ```python
 DATASETS = {
-    "openwebtext": DatasetConfig(
-        path="sytelus/openwebtext",
-        loader=_load_openwebtext_dataset,
-        sample_processor=_process_openwebtext_text,
+    "c4": DatasetConfig(
+        path="allenai/c4",
+        loader=partial(_load_c4_dataset, split="train"),
+        sample_processor=_process_c4_text,
     ),
-    "tiny_shakespeare": DatasetConfig(
-        path="karpathy/tiny_shakespeare",
-        loader=_load_tiny_shakespeare_dataset,
-        sample_processor=_process_shakespeare_text,
+    "c4_test": DatasetConfig(
+        path="tests/assets/c4_test",
+        loader=lambda path: load_dataset(path, split="train"),
+        sample_processor=_process_c4_text,
+    ),
+    "c4_validation": DatasetConfig(
+        path="allenai/c4",
+        loader=partial(_load_c4_dataset, split="validation"),
+        sample_processor=_process_c4_text,
     ),
 }
 ```
@@ -588,6 +660,8 @@ def _process_my_text(sample: dict[str, Any]) -> str:
 [training]
 dataset = "my_dataset"
 ```
+
+For more details, see `docs/datasets.md`.
 
 ---
 
@@ -638,6 +712,15 @@ export NCCL_P2P_DISABLE=1
 # Enable pin_memory for GPU transfer
 --training.dataloader.pin_memory true
 ```
+
+**5. Dataset Not Supported**
+
+```
+ValueError: Dataset tiny_shakespeare is not supported.
+```
+
+Register the dataset in `torchtitan/hf_datasets/text_datasets.py` (see Part 4.2)
+or switch to one of the built-in datasets (`c4`, `c4_test`, `c4_validation`).
 
 ---
 

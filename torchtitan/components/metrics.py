@@ -154,7 +154,7 @@ class WandBLogger(BaseLogger):
         self.wandb.init(
             entity=os.getenv("WANDB_TEAM", None),
             project=os.getenv("WANDB_PROJECT", "torchtitan"),
-            name=os.getenv("WANDB_RUN_NAME", None),
+            name=os.getenv("WANDB_RUN_NAME", "torchtitan-run"),
             id=os.getenv("WANDB_RUN_ID", None),
             notes=os.getenv("WANDB_RUN_NOTES", None),
             tags=os.getenv("WANDB_RUN_TAGS", None),
