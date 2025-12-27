@@ -14,11 +14,8 @@ This experiment provides a clean GPT-2 implementation that demonstrates:
 
 | Flavor | Parameters | Layers | Dim | Heads |
 |--------|------------|--------|-----|-------|
-| debugmodel | ~4M | 4 | 256 | 4 |
+| tiny | ~49M | 6 | 384 | 6 |
 | 124M | 124M | 12 | 768 | 12 |
-| 355M | 355M | 24 | 1024 | 16 |
-| 774M | 774M | 36 | 1280 | 20 |
-| 1558M | 1.5B | 48 | 1600 | 25 |
 
 ## Quick Start
 
@@ -34,7 +31,7 @@ python scripts/download_hf_assets.py \
     --local_dir ./assets/hf/gpt2
 ```
 
-### 2. Single GPU Debug Training (Shakespeare)
+### 2. Single GPU Tiny Training (Shakespeare)
 
 ```bash
 NGPU=1 CONFIG_FILE="./torchtitan/experiments/gpt2/train_configs/debug_model.toml" ./run_train.sh

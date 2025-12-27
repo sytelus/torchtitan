@@ -313,11 +313,8 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig) -> nn.Module:
 # - Small layers incur communication overhead that dominates compute time
 #
 # For GPT-2 models (all layers are well below 100M):
-#   - debugmodel: ~1.6M params/layer → group aggressively
+#   - tiny: ~1.8M params/layer → group aggressively
 #   - 124M: ~10M params/layer → group 10 layers together
-#   - 355M: ~14M params/layer → group 7 layers together
-#   - 774M: ~21M params/layer → group 5 layers together
-#   - 1558M: ~32M params/layer → group 3 layers together
 #
 # See: https://docs.pytorch.org/tutorials/intermediate/FSDP_advanced_tutorial.html
 _FSDP_MIN_PARAMS_PER_UNIT = 100_000_000  # 100M parameters

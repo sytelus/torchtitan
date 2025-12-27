@@ -23,10 +23,8 @@ class GPT2ModelArgs(BaseModelArgs):
     """Model hyperparameters for GPT-2-style transformers.
 
     GPT-2 Architecture:
+    - tiny: dim=384, n_layers=6, n_heads=6
     - 124M: dim=768, n_layers=12, n_heads=12
-    - 355M: dim=1024, n_layers=24, n_heads=16
-    - 774M: dim=1280, n_layers=36, n_heads=20
-    - 1.5B: dim=1600, n_layers=48, n_heads=25
     """
 
     dim: int = 768
@@ -47,7 +45,7 @@ class GPT2ModelArgs(BaseModelArgs):
     dropout: float = 0.0
     """Dropout probability (0.0 for pretraining, >0 for finetuning)."""
 
-    bias: bool = True
+    bias: bool = False
     """Whether to use bias in linear layers and LayerNorm."""
 
     norm_eps: float = 1e-5

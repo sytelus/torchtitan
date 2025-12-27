@@ -321,7 +321,7 @@ The TrainSpec connects everything:
 def get_train_spec() -> TrainSpec:
     return TrainSpec(
         model_cls=GPT2Model,
-        model_args=gpt2_configs,  # {"debugmodel": ..., "124M": ...}
+        model_args=gpt2_configs,  # {"tiny": ..., "124M": ...}
         parallelize_fn=parallelize_gpt2,
         pipelining_fn=None,  # Not implemented for GPT-2
         build_optimizers_fn=build_optimizers,
@@ -373,22 +373,22 @@ identical tokens for GPT-2.
 
 ### 4.2 Configuration File
 
-The debug configuration (`torchtitan/experiments/gpt2/train_configs/debug_model.toml`):
+The tiny configuration (`torchtitan/experiments/gpt2/train_configs/debug_model.toml`):
 
 ```toml
 [job]
-dump_folder = "./outputs/gpt2_debug"
-description = "GPT-2 debug training on tiny Shakespeare"
+dump_folder = "/home/shitals/out_dir/torchtitan/debug_model"
+description = "GPT-2 tiny training on tiny Shakespeare"
 
 [model]
 name = "gpt2"
-flavor = "debugmodel"
-hf_assets_path = "./assets/hf/gpt2"
+flavor = "tiny"
+# hf_assets_path = "./assets/hf/gpt2"
 
 [training]
-local_batch_size = 8
-seq_len = 1024
-steps = 1000
+local_batch_size = 64
+seq_len = 256
+steps = 2500
 dataset = "tiny_shakespeare"
 
 [parallelism]
@@ -401,7 +401,7 @@ pipeline_parallel_degree = 1
 
 ### 4.3 Enable WandB Logging
 
-Edit the config to enable WandB:
+WandB is enabled in the config by default:
 
 ```toml
 [metrics]
@@ -409,7 +409,7 @@ enable_tensorboard = false
 enable_wandb = true
 ```
 
-Or pass via command line:
+Or pass via command line (useful for overrides):
 
 ```bash
 NGPU=1 CONFIG_FILE="./torchtitan/experiments/gpt2/train_configs/debug_model.toml" \
@@ -434,9 +434,9 @@ export WANDB_BASE_URL="https://your-wandb-server.com"
 # Optional: Project and team configuration
 export WANDB_PROJECT="torchtitan"      # Project name (default: torchtitan)
 export WANDB_TEAM="your-team-name"     # Entity/team name
-export WANDB_RUN_NAME="gpt2-debug"     # Custom run name
+export WANDB_RUN_NAME="gpt2-tiny"      # Custom run name
 export WANDB_RUN_GROUP="experiment-1"  # Group related runs
-export WANDB_RUN_TAGS="debug,gpt2"     # Comma-separated tags
+export WANDB_RUN_TAGS="tiny,gpt2"      # Comma-separated tags
 export WANDB_RUN_NOTES="Testing GPT-2 training"  # Run description
 ```
 
@@ -451,11 +451,11 @@ NGPU=1 CONFIG_FILE="./torchtitan/experiments/gpt2/train_configs/debug_model.toml
 Expected output:
 
 ```
-[rank0] Starting training with config: GPT-2 debug training on tiny Shakespeare
-[rank0] Model: GPT2Model with 4.2M parameters
+[rank0] Starting training with config: GPT-2 tiny training on tiny Shakespeare
+[rank0] Model: GPT2Model with 49.3M parameters
 [rank0] No data parallelism applied (single GPU mode)
-[rank0] Step 1 | Loss: 10.82 | LR: 6.00e-06 | Tokens/s: 8192
-[rank0] Step 2 | Loss: 10.45 | LR: 1.20e-05 | Tokens/s: 8543
+[rank0] Step 1 | Loss: 10.82 | LR: 7.03e-06 | Tokens/s: 16384
+[rank0] Step 2 | Loss: 10.45 | LR: 1.41e-05 | Tokens/s: 17120
 ...
 ```
 
@@ -502,7 +502,7 @@ communication overhead. For example, training ConvNeXt_Large:
 - FSDP: 1,490 seconds (3x slower)
 
 For GPT-2 on B200 GPUs (192GB memory), DDP is strongly preferred:
-- GPT-2 1.5B is only ~3GB in bf16, easily fits in 192GB
+- GPT-2 124M comfortably fits in memory
 - No all-gather/reduce-scatter overhead
 - Simpler memory access patterns, better cache utilization
 
@@ -528,11 +528,8 @@ All GPT-2 variants have layers well below the 100M threshold:
 
 | Model | Layers | Params/Layer | Recommended Grouping |
 |-------|--------|--------------|---------------------|
-| debugmodel | 4 | ~1.6M | All 4 layers → 1 FSDP unit |
+| tiny | 6 | ~1.8M | All 6 layers → 1 FSDP unit |
 | 124M | 12 | ~10M | 6 layers → 2 FSDP units |
-| 355M | 24 | ~14M | 6 layers → 4 FSDP units |
-| 774M | 36 | ~21M | 4-5 layers → 8 FSDP units |
-| 1558M | 48 | ~32M | 3 layers → 16 FSDP units |
 
 **Why Layer Grouping Matters:**
 
@@ -584,18 +581,19 @@ The production configuration
 [model]
 name = "gpt2"
 flavor = "124M"
-hf_assets_path = "./assets/hf/gpt2"
+# hf_assets_path = "./assets/hf/gpt2"
 
 [optimizer]
 name = "AdamW"
-lr = 1.8e-3  # Higher LR for larger batch
+lr = 18e-4
 weight_decay = 0.1
 betas = [0.9, 0.95]
 
 [lr_scheduler]
 warmup_steps = 256
-decay_ratio = 0.6  # 60% training, 40% cooldown
+decay_ratio = 0.4  # 60% training, 40% cooldown
 decay_type = "cosine"
+min_lr_factor = 0.0
 
 [training]
 local_batch_size = 64  # 64 * 8 GPUs = 512 global batch
@@ -781,7 +779,7 @@ Update your training config to save checkpoints in HuggingFace format:
 ```toml
 [checkpoint]
 enable = true
-folder = "./outputs/gpt2_124m"
+folder = "checkpoint"
 interval = 1000  # Save every 1000 steps
 
 # Export to HuggingFace format on last save
@@ -794,7 +792,7 @@ Or pass via command line:
 NGPU=1 CONFIG_FILE="./torchtitan/experiments/gpt2/train_configs/debug_model.toml" \
     ./run_train.sh \
     --checkpoint.enable \
-    --checkpoint.folder "./outputs/gpt2_debug" \
+    --checkpoint.folder "/home/shitals/out_dir/torchtitan/debug_model/checkpoint" \
     --checkpoint.interval 500 \
     --checkpoint.last_save_in_hf
 ```
@@ -803,26 +801,26 @@ NGPU=1 CONFIG_FILE="./torchtitan/experiments/gpt2/train_configs/debug_model.toml
 
 The HuggingFace checkpoint requires a `config.json` file. Create one for your model:
 
-**For debugmodel (4M params):**
+**For tiny (~49M params):**
 
 ```bash
-cat > ./outputs/gpt2_debug/config.json << 'EOF'
+cat > /home/shitals/out_dir/torchtitan/debug_model/config.json << 'EOF'
 {
   "architectures": ["GPT2LMHeadModel"],
   "model_type": "gpt2",
   "vocab_size": 50257,
-  "n_positions": 1024,
-  "n_embd": 256,
-  "n_layer": 4,
-  "n_head": 4,
+  "n_positions": 256,
+  "n_embd": 384,
+  "n_layer": 6,
+  "n_head": 6,
   "activation_function": "gelu_new",
-  "resid_pdrop": 0.0,
-  "embd_pdrop": 0.0,
-  "attn_pdrop": 0.0,
+  "resid_pdrop": 0.2,
+  "embd_pdrop": 0.2,
+  "attn_pdrop": 0.2,
   "layer_norm_epsilon": 1e-5,
   "bos_token_id": 50256,
   "eos_token_id": 50256,
-  "tie_word_embeddings": true,
+  "tie_word_embeddings": false,
   "torch_dtype": "float32"
 }
 EOF
@@ -831,7 +829,7 @@ EOF
 **For GPT-2 124M:**
 
 ```bash
-cat > ./outputs/gpt2_124m/config.json << 'EOF'
+cat > /home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext/config.json << 'EOF'
 {
   "architectures": ["GPT2LMHeadModel"],
   "model_type": "gpt2",
@@ -847,7 +845,7 @@ cat > ./outputs/gpt2_124m/config.json << 'EOF'
   "layer_norm_epsilon": 1e-5,
   "bos_token_id": 50256,
   "eos_token_id": 50256,
-  "tie_word_embeddings": true,
+  "tie_word_embeddings": false,
   "torch_dtype": "bfloat16"
 }
 EOF
@@ -861,16 +859,16 @@ If you didn't use `last_save_in_hf`, you can convert checkpoints manually:
 python scripts/checkpoint_conversion/convert_to_hf.py \
     --model gpt2 \
     --flavor 124M \
-    --checkpoint_path ./outputs/gpt2_124m/step-20000 \
-    --output_path ./outputs/gpt2_124m_hf
+    --checkpoint_path /home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext/checkpoint/step-20000 \
+    --output_path /home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext_hf
 ```
 
 Then copy the config.json and tokenizer files:
 
 ```bash
-cp ./outputs/gpt2_124m/config.json ./outputs/gpt2_124m_hf/
-cp ./assets/hf/gpt2/tokenizer.json ./outputs/gpt2_124m_hf/
-cp ./assets/hf/gpt2/tokenizer_config.json ./outputs/gpt2_124m_hf/
+cp /home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext/config.json /home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext_hf/
+cp ./assets/hf/gpt2/tokenizer.json /home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext_hf/
+cp ./assets/hf/gpt2/tokenizer_config.json /home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext_hf/
 ```
 
 ### 8.5 Set Up lm_eval Environment
@@ -913,17 +911,17 @@ conda activate lm_eval
 
 # Run evaluation with vLLM (single GPU)
 lm_eval --model vllm \
-    --model_args pretrained=./outputs/gpt2_124m_hf,dtype=auto,gpu_memory_utilization=0.8 \
+    --model_args pretrained=/home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext_hf,dtype=auto,gpu_memory_utilization=0.8 \
     --tasks hellaswag,lambada_openai,winogrande,piqa,arc_easy,boolq \
     --batch_size auto \
-    --output_path ./outputs/gpt2_124m_eval
+    --output_path /home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext_eval
 
 # For multi-GPU evaluation (8 GPUs)
 lm_eval --model vllm \
-    --model_args pretrained=./outputs/gpt2_124m_hf,tensor_parallel_size=8,dtype=auto,gpu_memory_utilization=0.8 \
+    --model_args pretrained=/home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext_hf,tensor_parallel_size=8,dtype=auto,gpu_memory_utilization=0.8 \
     --tasks hellaswag,lambada_openai,winogrande,piqa,arc_easy,boolq \
     --batch_size auto \
-    --output_path ./outputs/gpt2_124m_eval
+    --output_path /home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext_eval
 ```
 
 #### Option B: Using HuggingFace Backend (Simpler, Slower)
@@ -933,11 +931,11 @@ conda activate lm_eval
 
 # Run evaluation with HuggingFace transformers
 lm_eval --model hf \
-    --model_args pretrained=./outputs/gpt2_124m_hf \
+    --model_args pretrained=/home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext_hf \
     --tasks hellaswag,lambada_openai,winogrande,piqa,arc_easy,boolq \
     --batch_size 16 \
     --device cuda:0 \
-    --output_path ./outputs/gpt2_124m_eval
+    --output_path /home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext_eval
 ```
 
 ### 8.7 Expected Results
@@ -960,7 +958,7 @@ similar to:
 - Random seed
 - Number of training steps
 
-A debug model trained on Shakespeare will score lower (near random baseline) on
+A tiny model trained on Shakespeare will score lower (near random baseline) on
 these benchmarks since it was trained on a very small, domain-specific dataset.
 
 ### 8.8 Interpreting Results
@@ -985,9 +983,9 @@ For longer training runs, you may want to evaluate at multiple checkpoints:
 #!/bin/bash
 # evaluate_checkpoints.sh
 
-CHECKPOINT_DIR="./outputs/gpt2_124m"
-OUTPUT_DIR="./outputs/gpt2_124m_eval"
-CONFIG_JSON="./outputs/gpt2_124m/config.json"
+CHECKPOINT_DIR="/home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext/checkpoint"
+OUTPUT_DIR="/home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext_eval"
+CONFIG_JSON="/home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext/config.json"
 TOKENIZER_DIR="./assets/hf/gpt2"
 
 for step in 5000 10000 15000 20000; do
@@ -1028,7 +1026,7 @@ For a quick sanity check, run a single fast benchmark:
 ```bash
 # Quick test with LAMBADA (fast, ~14K examples)
 lm_eval --model hf \
-    --model_args pretrained=./outputs/gpt2_debug_hf \
+    --model_args pretrained=/home/shitals/out_dir/torchtitan/debug_model_hf \
     --tasks lambada_openai \
     --limit 100 \
     --batch_size 8 \

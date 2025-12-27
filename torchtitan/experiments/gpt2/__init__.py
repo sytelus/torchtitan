@@ -4,10 +4,8 @@ GPT-2 Experiment for TorchTitan
 
 This experiment provides a simple GPT-2 implementation for learning TorchTitan.
 It supports:
-- GPT-2 124M (debugmodel, default)
-- GPT-2 355M
-- GPT-2 774M
-- GPT-2 1.5B
+- GPT-2 tiny
+- GPT-2 124M
 
 TOKENIZER:
 By default, uses tiktoken's fast GPT-2 tokenizer (no download required).
@@ -54,13 +52,15 @@ __all__ = [
 
 # GPT-2 model configurations
 gpt2_configs = {
-    # Debug model for testing (very small)
-    "debugmodel": GPT2ModelArgs(
-        dim=256,
-        n_layers=4,
-        n_heads=4,
+    # GPT-2 tiny
+    "tiny": GPT2ModelArgs(
+        dim=384,
+        n_layers=6,
+        n_heads=6,
         vocab_size=50257,
-        max_seq_len=1024,
+        max_seq_len=256,
+        dropout=0.2,
+        bias=False,
     ),
     # GPT-2 124M (Small)
     "124M": GPT2ModelArgs(
@@ -69,30 +69,8 @@ gpt2_configs = {
         n_heads=12,
         vocab_size=50257,
         max_seq_len=1024,
-    ),
-    # GPT-2 355M (Medium)
-    "355M": GPT2ModelArgs(
-        dim=1024,
-        n_layers=24,
-        n_heads=16,
-        vocab_size=50257,
-        max_seq_len=1024,
-    ),
-    # GPT-2 774M (Large)
-    "774M": GPT2ModelArgs(
-        dim=1280,
-        n_layers=36,
-        n_heads=20,
-        vocab_size=50257,
-        max_seq_len=1024,
-    ),
-    # GPT-2 1.5B (XL)
-    "1558M": GPT2ModelArgs(
-        dim=1600,
-        n_layers=48,
-        n_heads=25,
-        vocab_size=50257,
-        max_seq_len=1024,
+        dropout=0.0,
+        bias=False,
     ),
 }
 
