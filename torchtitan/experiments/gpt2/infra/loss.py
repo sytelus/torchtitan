@@ -27,8 +27,8 @@ materializing the full logits tensor.
 
 MEMORY SAVINGS:
 --------------
-For GPT-2 with vocab_size=50257, batch=64, seq=1024:
-- Logits tensor: 64 × 1024 × 50257 × 2 bytes (bf16) = ~6.5GB
+For GPT-2 with vocab_size=50304, batch=64, seq=1024:
+- Logits tensor: 64 × 1024 × 50304 × 2 bytes (bf16) ≈ 6.6GB
 - With fusion: Chunked computation, ~50% memory reduction
 
 See: https://github.com/pytorch/torchtune/pull/2507

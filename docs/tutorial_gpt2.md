@@ -58,114 +58,8 @@ LOCAL_RANK=0 NGPU=1 python -m torchtitan.train \
 
 ## Part 2: Understanding TorchTitan Architecture
 
-Before adding a new model, let's understand how TorchTitan organizes code:
-
-```
-torchtitan/
-├── models/              # Production models (Llama3, DeepSeek, etc.)
-├── experiments/         # Experimental models (including our GPT-2)
-│   └── gpt2/
-│       ├── model/
-│       │   ├── args.py      # Model hyperparameters
-│       │   └── model.py     # Model implementation
-│       ├── infra/
-│       │   └── parallelize.py  # Distributed training setup
-│       ├── train_configs/
-│       │   ├── debug_model.toml       # Single GPU config
-│       │   └── gpt2_124m_openwebtext.toml  # Multi-GPU config
-│       └── __init__.py      # TrainSpec registration
-├── components/          # Reusable training components
-├── hf_datasets/         # Dataset loading
-└── train.py             # Main training loop
-```
-
-### Key Concepts
-
-1. **TrainSpec**: Bundles model-specific components (model class, parallelization,
-   optimizer, dataloader, etc.) so the generic trainer can work with any model.
-
-2. **Model Protocol**: All models must implement `init_weights()` and accept
-   `model_args` in `__init__()`.
-
-3. **Parallelization Order**: TP → AC → compile → FSDP/DDP (order matters!)
-   - **GPT-2 exception**: For fused forward+loss, GPT-2 compiles *after* FSDP/DDP.
-     See Part 3.3 for details.
-
-### Why Parallelization Order Matters
-
-The order in which parallelization techniques are applied is critical for correctness
-and performance. Here's why each step must occur in sequence:
-
-```
-Original Model
-     │
-     ▼
-[1] TP: Shard tensors across devices (establishes layouts)
-     │
-     ▼
-[2] AC: Wrap blocks in CheckpointWrapper (respects TP layouts)
-     │
-     ▼
-[3] Compile: Trace graph with AC visible (before FSDP hooks)
-     │
-     ▼
-[4] FSDP/DDP: Add communication hooks (final step, after graph traced)
-     │
-     ▼
-Build Optimizer (sees final sharded parameters)
-```
-
-**Step 1: Tensor Parallelism (TP) — First**
-
-TP splits tensors across devices (e.g., column-wise for embeddings, row-wise for
-attention outputs). It must be applied first because it establishes the tensor
-sharding layouts that all subsequent steps must respect.
-
-```python
-# Example: embeddings split column-wise across TP ranks
-"tok_embeddings": RowwiseParallel(
-    input_layouts=Replicate(),
-    output_layouts=Shard(1),
-)
-```
-
-**Step 2: Activation Checkpointing (AC) — Second**
-
-AC wraps transformer blocks in `CheckpointWrapper` to trade compute for memory
-(recompute activations during backward instead of storing them). It must:
-- Come **after TP** to respect the established tensor layouts
-- Come **before compile** so the compiler can see and optimize the checkpointing pattern
-
-**Step 3: torch.compile — Third**
-
-Compile traces the computation graph and generates optimized kernels. It must:
-- Come **after AC** to see the CheckpointWrapper and properly trace the control flow
-- Come **before FSDP** because FSDP adds communication hooks (all-gather,
-  reduce-scatter) that cause **graph breaks**
-
-```python
-# From parallelize.py - the comment explains the ordering
-# turn on per-TransformerBlock compile after AC wrapping and before FSDP
-if model_compile_enabled:
-    apply_compile(model, job_config.compile)
-```
-
-**Step 4: FSDP/DDP — Last**
-
-Data parallelism shards parameters across devices. Applied last because:
-- FSDP adds hooks that would break the torch.compile graph if applied earlier
-- The optimizer is built **after** parallelism, so it sees the final sharded parameters
-
-**The Graph-Breaking Problem**
-
-The critical constraint is avoiding graph breaks for `torch.compile`. If FSDP is
-applied before compile, the communication hooks fragment the graph, forcing
-activation checkpointing to fall back to eager execution — destroying performance.
-
-**GPT-2 note:** In this tutorial, GPT-2 compiles after FSDP/DDP to enable fused
-output projection + loss. `torch.compile` will still optimize subgraphs around
-the communication hooks, and the fusion benefits outweigh the graph breaks for
-small models.
+For the TorchTitan architecture overview and parallelization order, see
+`docs/architecture.md`.
 
 ### GPT-2's Alternative: Fused Forward+Loss Compilation
 
@@ -190,8 +84,8 @@ model = torch.compile(model)                  # Whole model compiled together
 
 **Why fused compilation is better for GPT-2:**
 
-1. **Memory savings**: For GPT-2 with vocab=50257, batch=64, seq=1024:
-   - Without fusion: ~6.5GB for logits tensor in bf16
+1. **Memory savings**: For GPT-2 with vocab=50304, batch=64, seq=1024:
+   - Without fusion: ~6.6GB for logits tensor in bf16
    - With fusion: ~50% reduction through chunked computation
 
 2. **Per-layer has minimal runtime benefit for small models**: PyTorch docs note
@@ -222,10 +116,10 @@ class GPT2ModelArgs(BaseModelArgs):
     dim: int = 768           # Hidden size
     n_layers: int = 12       # Number of transformer blocks
     n_heads: int = 12        # Number of attention heads
-    vocab_size: int = 50257  # GPT-2 vocabulary size
+    vocab_size: int = 50304  # Padded vocab size (GPT-2 tokenizer is 50257)
     max_seq_len: int = 1024  # Context window
     dropout: float = 0.0     # Dropout (0 for pretraining)
-    bias: bool = True        # Use bias in linear layers
+    bias: bool = False       # Use bias in linear layers
     weight_tying: bool = False  # Optionally tie embedding and output weights
 ```
 
@@ -338,7 +232,8 @@ def get_train_spec() -> TrainSpec:
 
 ### 4.1 Tokenizer Setup
 
-GPT-2 uses a BPE tokenizer with 50,257 tokens. You have two options:
+GPT-2 uses a BPE tokenizer with 50,257 tokens. The model vocab is padded to
+50,304 for efficiency. You have two options:
 
 **Option A: Use tiktoken (Recommended)**
 
@@ -808,7 +703,7 @@ cat > /home/shitals/out_dir/torchtitan/debug_model/config.json << 'EOF'
 {
   "architectures": ["GPT2LMHeadModel"],
   "model_type": "gpt2",
-  "vocab_size": 50257,
+  "vocab_size": 50304,
   "n_positions": 256,
   "n_embd": 384,
   "n_layer": 6,
@@ -833,7 +728,7 @@ cat > /home/shitals/out_dir/torchtitan/gpt2_124m_openwebtext/config.json << 'EOF
 {
   "architectures": ["GPT2LMHeadModel"],
   "model_type": "gpt2",
-  "vocab_size": 50257,
+  "vocab_size": 50304,
   "n_positions": 1024,
   "n_embd": 768,
   "n_layer": 12,

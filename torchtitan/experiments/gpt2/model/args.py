@@ -36,8 +36,8 @@ class GPT2ModelArgs(BaseModelArgs):
     n_heads: int = 12
     """Number of attention heads."""
 
-    vocab_size: int = 50257
-    """Vocabulary size (GPT-2 tokenizer vocab size)."""
+    vocab_size: int = 50304
+    """Vocabulary size (padded to 50304 for efficiency; GPT-2 tokenizer is 50257)."""
 
     max_seq_len: int = 1024
     """Maximum sequence length (context window)."""
@@ -72,14 +72,27 @@ class GPT2ModelArgs(BaseModelArgs):
         Returns:
             Tuple of (n_params, flops_per_token)
         """
-        # Count parameters
+        # Count parameters (account for weight tying when weights aren't tied yet).
         n_params = sum(p.numel() for p in model.parameters())
+        if (
+            self.weight_tying
+            and hasattr(model, "tok_embeddings")
+            and hasattr(model, "output")
+            and getattr(model.output, "weight", None) is not None
+            and getattr(model.tok_embeddings, "weight", None) is not None
+            and model.output.weight is not model.tok_embeddings.weight
+        ):
+            n_params -= self.vocab_size * self.dim
 
         # Calculate FLOPs per forward pass (approximate)
         # For each transformer layer:
         # - Attention: 4 * seq_len * dim^2 (Q,K,V,O projections) + 2 * seq_len^2 * dim (attention scores)
         # - FFN: 8 * seq_len * dim^2 (two linear layers with 4*dim hidden)
         # Total per layer: 12 * seq_len * dim^2 + 2 * seq_len^2 * dim
+        # Output projection (lm_head):
+        # - Logits: 2 * seq_len * dim * vocab_size (matmul, multiply-adds counted as 2 ops)
+        # Loss (when fused in forward):
+        # - log-softmax + NLL: ~3 * seq_len * vocab_size (approximate)
 
         d = self.dim
         L = self.n_layers
@@ -89,7 +102,11 @@ class GPT2ModelArgs(BaseModelArgs):
         attn_flops = 4 * s * d * d + 2 * s * s * d  # per layer
         ffn_flops = 2 * s * d * (4 * d)  # 2 matmuls with 4*dim hidden
         layer_flops = attn_flops + ffn_flops
-        total_flops = L * layer_flops
+        output_flops = 2 * s * d * self.vocab_size
+        loss_flops = 0
+        if getattr(model, "loss_in_forward", False):
+            loss_flops = 3 * s * self.vocab_size
+        total_flops = L * layer_flops + output_flops + loss_flops
 
         # Per-token FLOPs
         flops_per_token = total_flops // s

@@ -43,6 +43,113 @@ PyTorch; distributed behavior is injected by adapters and wrappers.
   Model definition, model args, and model-specific infra (e.g., parallelization
   plans for Llama). Train configs live under `train_configs/`.
 
+## Example: GPT-2 experiment layout
+
+For a concrete example of the experiments layout, the GPT-2 tutorial lives in
+`torchtitan/experiments/gpt2/`:
+
+```
+torchtitan/
+├── models/              # Production models (Llama3, DeepSeek, etc.)
+├── experiments/         # Experimental models (including GPT-2)
+│   └── gpt2/
+│       ├── model/
+│       │   ├── args.py      # Model hyperparameters
+│       │   └── model.py     # Model implementation
+│       ├── infra/
+│       │   └── parallelize.py  # Distributed training setup
+│       ├── train_configs/
+│       │   ├── debug_model.toml       # Single GPU config
+│       │   └── gpt2_124m_openwebtext.toml  # Multi-GPU config
+│       └── __init__.py      # TrainSpec registration
+├── components/          # Reusable training components
+├── hf_datasets/         # Dataset loading
+└── train.py             # Main training loop
+```
+
+## Key concepts for model integrations
+
+1. **TrainSpec**: Bundles model-specific components (model class, parallelization,
+   optimizer, dataloader, etc.) so the generic trainer can work with any model.
+
+2. **Model Protocol**: All models must implement `init_weights()` and accept
+   `model_args` in `__init__()`.
+
+3. **Parallelization Order**: TP → AC → compile → FSDP/DDP (order matters!)
+   - **GPT-2 exception**: For fused forward+loss, GPT-2 compiles *after* FSDP/DDP.
+     See `docs/tutorial_gpt2.md` for details.
+
+## Parallelization order (TP → AC → compile → FSDP/DDP)
+
+The order in which parallelization techniques are applied is critical for
+correctness and performance. Each step must occur in sequence:
+
+```
+Original Model
+     │
+     ▼
+[1] TP: Shard tensors across devices (establishes layouts)
+     │
+     ▼
+[2] AC: Wrap blocks in CheckpointWrapper (respects TP layouts)
+     │
+     ▼
+[3] Compile: Trace graph with AC visible (before FSDP hooks)
+     │
+     ▼
+[4] FSDP/DDP: Add communication hooks (final step, after graph traced)
+     │
+     ▼
+Build Optimizer (sees final sharded parameters)
+```
+
+**Step 1: Tensor Parallelism (TP) — First**
+
+TP splits tensors across devices (e.g., column-wise for embeddings, row-wise for
+attention outputs). It must be applied first because it establishes the tensor
+sharding layouts that all subsequent steps must respect.
+
+```python
+# Example: embeddings split column-wise across TP ranks
+"tok_embeddings": RowwiseParallel(
+    input_layouts=Replicate(),
+    output_layouts=Shard(1),
+)
+```
+
+**Step 2: Activation Checkpointing (AC) — Second**
+
+AC wraps transformer blocks in `CheckpointWrapper` to trade compute for memory
+(recompute activations during backward instead of storing them). It must:
+- Come **after TP** to respect the established tensor layouts
+- Come **before compile** so the compiler can see and optimize the checkpointing pattern
+
+**Step 3: torch.compile — Third**
+
+Compile traces the computation graph and generates optimized kernels. It must:
+- Come **after AC** to see the CheckpointWrapper and properly trace the control flow
+- Come **before FSDP** because FSDP adds communication hooks (all-gather,
+  reduce-scatter) that cause **graph breaks**
+
+```python
+# From parallelize.py - the comment explains the ordering
+# turn on per-TransformerBlock compile after AC wrapping and before FSDP
+if model_compile_enabled:
+    apply_compile(model, job_config.compile)
+```
+
+**Step 4: FSDP/DDP — Last**
+
+Data parallelism shards parameters across devices. Applied last because:
+- FSDP adds hooks that would break the torch.compile graph if applied earlier
+- The optimizer is built **after** parallelism, so it sees the final sharded parameters
+
+**The Graph-Breaking Problem**
+
+The critical constraint is avoiding graph breaks for `torch.compile`. If FSDP is
+applied before compile, the communication hooks fragment the graph, forcing
+activation checkpointing to fall back to eager execution — destroying performance.
+
 ## Training flow (what happens in `train.py`)
 
 1. **Config parsing**

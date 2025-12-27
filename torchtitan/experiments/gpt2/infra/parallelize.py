@@ -29,8 +29,8 @@ because it can be superior for small models:
 
 1. FUSED OUTPUT + LOSS: Wrapping output projection + cross_entropy in a single
    torch.compile call enables fusion that avoids materializing the full
-   [batch, seq, vocab_size] logits tensor. For GPT-2 with vocab=50257:
-   - Logits: 64 × 1024 × 50257 × 2 bytes = ~6.5GB in bf16
+   [batch, seq, vocab_size] logits tensor. For GPT-2 with vocab=50304:
+   - Logits: 64 × 1024 × 50304 × 2 bytes ≈ 6.6GB in bf16
    - Fused: Only chunked computation, ~50% memory reduction
    (See: https://github.com/pytorch/torchtune/pull/2507)
 
@@ -39,7 +39,7 @@ because it can be superior for small models:
    reduces COMPILE TIME (67s → 9.6s), not execution time.
    (See: https://docs.pytorch.org/tutorials/recipes/regional_compilation.html)
 
-3. SMALL MODELS: For models with few layers (e.g., 4-layer debug), whole-model
+3. SMALL MODELS: For models with few layers (e.g., 6-layer tiny), whole-model
    compilation may produce better code through cross-layer fusion.
 
 This implementation compiles the entire model (including loss) so torch.compile
@@ -252,8 +252,8 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig) -> nn.Module:
        the output projection (model.output) with cross-entropy loss, avoiding
        materialization of the full [batch, seq, vocab_size] logits tensor.
 
-       Memory savings for GPT-2 (vocab=50257, batch=64, seq=1024):
-       - Without fusion: ~6.5GB for logits tensor in bf16
+       Memory savings for GPT-2 (vocab=50304, batch=64, seq=1024):
+       - Without fusion: ~6.6GB for logits tensor in bf16
        - With fusion: ~50% reduction through chunked computation
 
     2. SMALL MODEL BENEFITS: For small models like GPT-2 (4-48 layers), the
@@ -390,7 +390,7 @@ def apply_fsdp(
     =================
     1. Embeddings (tok_embeddings, pos_embeddings):
        - Sharded with reshard_after_forward=True
-       - For GPT-2: tok_embeddings is large (vocab_size × dim = 50257 × 768 ≈ 150MB)
+       - For GPT-2: tok_embeddings is large (vocab_size × dim = 50304 × 768 ≈ 155MB)
 
     2. Transformer blocks (grouped for efficiency):
        - Multiple layers grouped into single FSDP units

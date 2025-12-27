@@ -152,6 +152,8 @@ class GPT2Model(nn.Module, ModelProtocol):
     def __init__(self, model_args: GPT2ModelArgs):
         super().__init__()
         self.model_args = model_args
+        # Signals that loss can be computed inside forward() when labels are provided.
+        self.loss_in_forward = True
 
         # Token and position embeddings
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
@@ -199,7 +201,7 @@ class GPT2Model(nn.Module, ModelProtocol):
 
         Memory savings from fused loss:
         - Without fusion: logits tensor = batch × seq × vocab × dtype_size
-          For GPT-2 (vocab=50257): 64 × 1024 × 50257 × 2 bytes = ~6.5GB in bf16
+          For GPT-2 (vocab=50304): 64 × 1024 × 50304 × 2 bytes ≈ 6.6GB in bf16
         - With fusion: Only chunked computation, ~50% memory reduction
 
         Args:

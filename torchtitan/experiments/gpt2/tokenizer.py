@@ -117,11 +117,11 @@ class TiktokenTokenizer(BaseTokenizer):
 
     @property
     def vocab_size(self) -> int:
-        """Get the vocabulary size (50257 for GPT-2)."""
+        """Get the tokenizer vocabulary size (50257 for GPT-2)."""
         return self._encoding.n_vocab
 
     def get_vocab_size(self) -> int:
-        """Get the vocabulary size (50257 for GPT-2)."""
+        """Get the tokenizer vocabulary size (50257 for GPT-2)."""
         return self._encoding.n_vocab
 
     def token_to_id(self, token: str) -> int:
