@@ -592,7 +592,7 @@ betas = [0.9, 0.95]
 [lr_scheduler]
 warmup_steps = 256
 decay_ratio = 0.4  # 60% training, 40% cooldown
-decay_type = "cosine"
+decay_type = "linear"
 min_lr_factor = 0.0
 
 [training]
