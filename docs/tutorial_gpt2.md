@@ -595,6 +595,15 @@ enable = true
 components = ["model"]
 ```
 
+### 5.2.1 OpenWebText Dataset Notes (Splits, Download, Paths)
+
+- **Split used**: TorchTitan’s OpenWebText loader always reads the `train` split. In this tutorial config, validation also points to `openwebtext`, so training and validation both consume the same stream.
+- **Downloads**: The dataset is streamed from Hugging Face, so there is no manual download step; data is cached on demand.
+- **Local/mirrored data**: Set `training.dataset_path` (and `validation.dataset_path` if different) in your `.toml` to override the default Hugging Face path.
+- **Match NanoGPT splits**: NanoGPT creates its own train/val split during data prep. If you want the same split, create those splits locally and either:
+  - add two dataset entries in `hf_datasets/text_datasets.py` that load the exact split you want, or
+  - point `training.dataset_path` and `validation.dataset_path` at separate local datasets that each expose a `train` split.
+
 ### 5.3 Run 8 GPU Training
 
 ```bash
